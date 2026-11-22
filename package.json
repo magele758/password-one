@@ -1,0 +1,39 @@
+{
+  "name": "@opc/password-one",
+  "version": "0.1.0",
+  "description": "Zero-Knowledge Policy-Bound Blind Credential Broker & 6-Encoding Output Scrubber for AI Agents",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=23.6.0"
+  },
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./server": "./src/server.ts",
+    "./mcp": "./src/mcp.ts"
+  },
+  "bin": {
+    "password-one": "./src/cli.ts",
+    "pw1": "./src/cli.ts"
+  },
+  "scripts": {
+    "start": "node src/cli.ts serve",
+    "test": "node --test src/password-one.test.ts",
+    "benchmark": "node src/cli.ts benchmark",
+    "mcp": "node src/cli.ts mcp",
+    "demo": "node src/cli.ts demo",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "keywords": [
+    "ai-agent",
+    "security",
+    "credential-broker",
+    "mcp",
+    "zero-knowledge",
+    "prompt-injection",
+    "ssrf",
+    "secret-scrubber",
+    "aes-256-gcm"
+  ]
+}
