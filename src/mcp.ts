@@ -2,14 +2,22 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 import { PasswordOneBroker, type BrokerOptions } from './broker.ts';
-import { SERVICE_VERSION } from './server.ts';
 import {
+  DEFAULT_DEV_MASTER_KEY,
   PasswordOneError,
+  SERVICE_VERSION,
   type HttpAuthBinding,
   type ProxyExecRequest,
   type ProxyHttpRequest,
 } from './types.ts';
 import { PasswordOneVault } from './vault.ts';
+
+const SUPPORTED_MCP_PROTOCOL_VERSIONS = new Set([
+  '2024-11-05',
+  '2025-03-26',
+  '2025-06-18',
+  '2025-11-25',
+]);
 
 export interface JsonRpcRequest {
   jsonrpc: '2.0';
@@ -132,10 +140,14 @@ export class PasswordOneMcpDispatcher {
   }
 
   async handleMessage(msg: JsonRpcRequest): Promise<JsonRpcResponse | null> {
-    if (!msg || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
+    if (!msg || typeof msg !== 'object' || Array.isArray(msg) || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
+      const maybeId =
+        msg && typeof msg === 'object' && !Array.isArray(msg) && (typeof msg.id === 'string' || typeof msg.id === 'number')
+          ? msg.id
+          : null;
       return {
         jsonrpc: '2.0',
-        id: msg?.id ?? null,
+        id: maybeId,
         error: { code: -32600, message: 'Invalid JSON-RPC 2.0 request' },
       };
     }
@@ -148,11 +160,17 @@ export class PasswordOneMcpDispatcher {
     try {
       switch (msg.method) {
         case 'initialize': {
+          const requestedVersion =
+            typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : undefined;
+          const protocolVersion =
+            requestedVersion && SUPPORTED_MCP_PROTOCOL_VERSIONS.has(requestedVersion)
+              ? requestedVersion
+              : '2024-11-05';
           return {
             jsonrpc: '2.0',
             id: msg.id,
             result: {
-              protocolVersion: '2024-11-05',
+              protocolVersion,
               capabilities: {
                 tools: {},
               },
@@ -324,7 +342,7 @@ export async function runMcpServer(options?: McpStdioOptions): Promise<{ close: 
     options?.vault ??
     new PasswordOneVault({
       dbPath: options?.dataPath ?? process.env.DATA_PATH ?? join(process.cwd(), 'data', 'password-one.sqlite'),
-      masterKey: options?.masterKey ?? process.env.PW1_MASTER_KEY ?? 'pw1-local-dev-master-key-change-in-prod',
+      masterKey: options?.masterKey ?? process.env.PW1_MASTER_KEY ?? DEFAULT_DEV_MASTER_KEY,
     });
   const broker = options?.broker ?? new PasswordOneBroker(vault, options?.brokerOptions);
   const dispatcher = new PasswordOneMcpDispatcher(vault, broker);

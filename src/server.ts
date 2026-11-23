@@ -1,10 +1,14 @@
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { runRedBlueBenchmark } from './benchmark.ts';
 import { PasswordOneBroker, type BrokerOptions } from './broker.ts';
+import { PasswordOneMcpDispatcher, type JsonRpcRequest, type JsonRpcResponse } from './mcp.ts';
 import {
+  DEFAULT_DEV_MASTER_KEY,
   PasswordOneError,
+  SERVICE_VERSION,
   type CreateGrantInput,
   type ProxyExecRequest,
   type ProxyHttpRequest,
@@ -12,15 +16,17 @@ import {
 } from './types.ts';
 import { PasswordOneVault } from './vault.ts';
 
-export const SERVICE_VERSION = '0.1.0';
+export { DEFAULT_DEV_MASTER_KEY, SERVICE_VERSION } from './types.ts';
 export const DEFAULT_PORT = 52342;
 export const DEFAULT_HOST = '127.0.0.1';
+export const MIN_AUTH_TOKEN_LENGTH = 16;
 
 export interface PasswordOneServerOptions {
   port?: number;
   host?: string;
   dataPath?: string;
   masterKey?: string;
+  authToken?: string;
   scryptN?: number;
   brokerOptions?: BrokerOptions;
 }
@@ -32,20 +38,69 @@ export interface RunningPasswordOneServer {
   host: string;
   port: number;
   baseUrl: string;
+  authEnabled: boolean;
   close: () => Promise<void>;
 }
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
+const MAX_MCP_SESSIONS = 1024;
 
-function sendJson(res: ServerResponse, statusCode: number, payload: unknown): void {
+export function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return normalized === '127.0.0.1' || normalized === '::1' || normalized === 'localhost';
+}
+
+function formatHostForUrl(host: string): string {
+  return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+}
+
+function sha256Digest(value: string): Buffer {
+  return createHash('sha256').update(value, 'utf8').digest();
+}
+
+function extractBearerToken(req: IncomingMessage): string | null {
+  const raw = req.headers['authorization'];
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const match = /^Bearer[ \t]+(.+)$/i.exec(raw.trim());
+  return match ? match[1] : null;
+}
+
+function isAuthorizedRequest(req: IncomingMessage, expectedTokenDigest: Buffer): boolean {
+  const presented = extractBearerToken(req);
+  if (!presented) {
+    return false;
+  }
+  const presentedDigest = sha256Digest(presented);
+  return timingSafeEqual(presentedDigest, expectedTokenDigest);
+}
+
+function sendJson(
+  res: ServerResponse,
+  statusCode: number,
+  payload: unknown,
+  extraHeaders?: Record<string, string>
+): void {
   const body = JSON.stringify(payload);
   res.writeHead(statusCode, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body, 'utf8'),
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
+    ...extraHeaders,
   });
   res.end(body);
+}
+
+function sendAccepted(res: ServerResponse, extraHeaders?: Record<string, string>): void {
+  res.writeHead(202, {
+    'content-length': 0,
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    ...extraHeaders,
+  });
+  res.end();
 }
 
 async function readJsonBody<T>(req: IncomingMessage): Promise<T> {
@@ -87,11 +142,44 @@ async function readJsonBody<T>(req: IncomingMessage): Promise<T> {
 export async function startPasswordOneServer(
   options?: PasswordOneServerOptions
 ): Promise<RunningPasswordOneServer> {
-  const port = options?.port ?? (process.env.PORT ? Number(process.env.PORT) : DEFAULT_PORT);
-  const host = options?.host ?? process.env.HOST ?? DEFAULT_HOST;
-  const dataPath = options?.dataPath ?? process.env.DATA_PATH ?? join(process.cwd(), 'data', 'password-one.sqlite');
+  const rawEnvPort = process.env.PORT?.trim();
+  const port = options?.port ?? (rawEnvPort ? Number(rawEnvPort) : DEFAULT_PORT);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new PasswordOneError('INVALID_INPUT', 'Invalid PORT configuration (expected integer 0-65535)', 400);
+  }
+
+  const host = (options?.host ?? (process.env.HOST?.trim() || undefined) ?? DEFAULT_HOST).trim();
+  const dataPath =
+    options?.dataPath ??
+    (process.env.DATA_PATH?.trim() || undefined) ??
+    join(process.cwd(), 'data', 'password-one.sqlite');
+  const authToken =
+    options?.authToken !== undefined
+      ? options.authToken.trim() || undefined
+      : process.env.PW1_AUTH_TOKEN?.trim() || undefined;
+  const rawMasterKey = options?.masterKey !== undefined ? options.masterKey : process.env.PW1_MASTER_KEY;
+  const trimmedMasterKey = rawMasterKey?.trim() ?? '';
+
+  if (!isLoopbackHost(host)) {
+    if (!authToken || authToken.length < MIN_AUTH_TOKEN_LENGTH) {
+      throw new PasswordOneError(
+        'INVALID_INPUT',
+        `Refusing to bind non-loopback host "${host}" without PW1_AUTH_TOKEN (minimum ${MIN_AUTH_TOKEN_LENGTH} characters)`,
+        400
+      );
+    }
+    if (!trimmedMasterKey || trimmedMasterKey === DEFAULT_DEV_MASTER_KEY) {
+      throw new PasswordOneError(
+        'INVALID_INPUT',
+        `Refusing to bind non-loopback host "${host}" without an explicit non-default PW1_MASTER_KEY`,
+        400
+      );
+    }
+  }
+
   const masterKey =
-    options?.masterKey ?? process.env.PW1_MASTER_KEY ?? 'pw1-local-dev-master-key-change-in-prod';
+    rawMasterKey !== undefined && trimmedMasterKey.length > 0 ? rawMasterKey : DEFAULT_DEV_MASTER_KEY;
+  const expectedTokenDigest = authToken ? sha256Digest(authToken) : null;
 
   const vault = new PasswordOneVault({
     dbPath: dataPath,
@@ -99,15 +187,37 @@ export async function startPasswordOneServer(
     scryptN: options?.scryptN,
   });
   const broker = new PasswordOneBroker(vault, options?.brokerOptions);
+  const mcpDispatcher = new PasswordOneMcpDispatcher(vault, broker);
+  const mcpSessions = new Set<string>();
+  const createMcpSession = (): string => {
+    if (mcpSessions.size >= MAX_MCP_SESSIONS) {
+      const oldest = mcpSessions.values().next().value;
+      if (oldest) {
+        mcpSessions.delete(oldest);
+      }
+    }
+    const id = randomUUID();
+    mcpSessions.add(id);
+    return id;
+  };
   const startedAt = Date.now();
+  const urlHost = formatHostForUrl(host);
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     try {
       const method = (req.method ?? 'GET').toUpperCase();
-      const parsedUrl = new URL(req.url ?? '/', `http://${host}:${port}`);
+      const parsedUrl = new URL(req.url ?? '/', `http://${urlHost}:${port}`);
       const pathname = parsedUrl.pathname;
 
       if (method === 'GET' && pathname === '/health') {
+        if (expectedTokenDigest && !isAuthorizedRequest(req, expectedTokenDigest)) {
+          sendJson(res, 200, {
+            ok: true,
+            service: 'password-one',
+            version: SERVICE_VERSION,
+          });
+          return;
+        }
         const stats = vault.getStats();
         sendJson(res, 200, {
           ok: true,
@@ -120,6 +230,141 @@ export async function startPasswordOneServer(
           auditHeadHash: stats.auditVerification.headHash,
           uptimeMs: Date.now() - startedAt,
         });
+        return;
+      }
+
+      if (expectedTokenDigest && !isAuthorizedRequest(req, expectedTokenDigest)) {
+        sendJson(
+          res,
+          401,
+          {
+            ok: false,
+            error: {
+              code: 'UNAUTHORIZED',
+              message: 'Valid Bearer token required',
+            },
+          },
+          { 'www-authenticate': 'Bearer realm="password-one"' }
+        );
+        return;
+      }
+
+      if (pathname === '/mcp') {
+        if (method === 'GET') {
+          sendJson(
+            res,
+            405,
+            {
+              ok: false,
+              error: {
+                code: 'METHOD_NOT_ALLOWED',
+                message: 'GET /mcp is not supported; use POST or DELETE',
+              },
+            },
+            { allow: 'POST, DELETE' }
+          );
+          return;
+        }
+
+        if (method === 'DELETE') {
+          const reqSessionId = req.headers['mcp-session-id'];
+          if (typeof reqSessionId === 'string' && reqSessionId.trim()) {
+            mcpSessions.delete(reqSessionId.trim());
+          }
+          sendJson(res, 200, { ok: true });
+          return;
+        }
+
+        if (method !== 'POST') {
+          sendJson(
+            res,
+            405,
+            {
+              ok: false,
+              error: {
+                code: 'METHOD_NOT_ALLOWED',
+                message: `Method ${method} is not allowed on /mcp; use POST or DELETE`,
+              },
+            },
+            { allow: 'POST, DELETE' }
+          );
+          return;
+        }
+
+        let parsedPayload: unknown;
+        try {
+          parsedPayload = await readJsonBody<unknown>(req);
+        } catch (err) {
+          if (err instanceof PasswordOneError && err.statusCode === 400) {
+            sendJson(res, 400, {
+              jsonrpc: '2.0',
+              id: null,
+              error: { code: -32700, message: 'Parse error' },
+            });
+            return;
+          }
+          throw err;
+        }
+
+        if (Array.isArray(parsedPayload)) {
+          if (parsedPayload.length === 0) {
+            sendJson(res, 400, {
+              jsonrpc: '2.0',
+              id: null,
+              error: { code: -32600, message: 'Invalid Request: empty JSON-RPC batch' },
+            });
+            return;
+          }
+
+          const responses: JsonRpcResponse[] = [];
+          let initializedSessionId: string | undefined;
+
+          for (const item of parsedPayload) {
+            const response = await mcpDispatcher.handleMessage(item as JsonRpcRequest);
+            if (response) {
+              responses.push(response);
+              if (
+                !initializedSessionId &&
+                item &&
+                typeof item === 'object' &&
+                !Array.isArray(item) &&
+                (item as JsonRpcRequest).method === 'initialize' &&
+                !response.error
+              ) {
+                initializedSessionId = createMcpSession();
+              }
+            }
+          }
+
+          const extraHeaders = initializedSessionId ? { 'mcp-session-id': initializedSessionId } : undefined;
+          if (responses.length === 0) {
+            sendAccepted(res, extraHeaders);
+            return;
+          }
+
+          sendJson(res, 200, responses, extraHeaders);
+          return;
+        }
+
+        const singleReq = parsedPayload as JsonRpcRequest;
+        const response = await mcpDispatcher.handleMessage(singleReq);
+        if (!response) {
+          sendAccepted(res);
+          return;
+        }
+
+        let extraHeaders: Record<string, string> | undefined;
+        if (
+          singleReq &&
+          typeof singleReq === 'object' &&
+          !Array.isArray(singleReq) &&
+          singleReq.method === 'initialize' &&
+          !response.error
+        ) {
+          extraHeaders = { 'mcp-session-id': createMcpSession() };
+        }
+
+        sendJson(res, 200, response, extraHeaders);
         return;
       }
 
@@ -234,17 +479,22 @@ export async function startPasswordOneServer(
     }
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, host, () => {
-      server.off('error', reject);
-      resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(port, host, () => {
+        server.off('error', reject);
+        resolve();
+      });
     });
-  });
+  } catch (err) {
+    vault.close();
+    throw err;
+  }
 
   const addr = server.address() as AddressInfo;
   const boundPort = addr.port;
-  const baseUrl = `http://${host}:${boundPort}`;
+  const baseUrl = `http://${urlHost}:${boundPort}`;
 
   let closed = false;
   const close = async (): Promise<void> => {
@@ -261,6 +511,7 @@ export async function startPasswordOneServer(
     host,
     port: boundPort,
     baseUrl,
+    authEnabled: expectedTokenDigest !== null,
     close,
   };
 }

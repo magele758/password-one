@@ -1,5 +1,8 @@
 // Core domain types, policies, audit structures, and error classes for Password One
 
+export const SERVICE_VERSION = '0.1.0';
+export const DEFAULT_DEV_MASTER_KEY = 'pw1-local-dev-master-key-change-in-prod';
+
 export type AllowedToolKind = 'http' | 'exec';
 
 export type CrossOriginRedirectMode = 'block' | 'strip';
@@ -188,6 +191,7 @@ export interface AuditVerificationResult {
 
 export type ErrorCode =
   | 'INVALID_INPUT'
+  | 'UNAUTHORIZED'
   | 'SECRET_NOT_FOUND'
   | 'POLICY_VIOLATION'
   | 'POLICY_TAMPER_DETECTED'

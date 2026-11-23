@@ -1,6 +1,13 @@
 import * as assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
+import {
+  createServer,
+  request as httpRequest,
+  type IncomingHttpHeaders,
+  type IncomingMessage,
+  type ServerResponse,
+} from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,7 +25,12 @@ import {
 } from './crypto.ts';
 import { MCP_TOOLS_DEFINITION, PasswordOneMcpDispatcher, runMcpServer, type JsonRpcResponse } from './mcp.ts';
 import { OutputScrubber } from './scrubber.ts';
-import { startPasswordOneServer } from './server.ts';
+import {
+  DEFAULT_DEV_MASTER_KEY,
+  isLoopbackHost,
+  SERVICE_VERSION,
+  startPasswordOneServer,
+} from './server.ts';
 import {
   LeaseError,
   PasswordOneError,
@@ -26,6 +38,67 @@ import {
   PolicyViolationError,
 } from './types.ts';
 import { hostMatchesAny, PasswordOneVault } from './vault.ts';
+
+async function httpRawRequest(params: {
+  baseUrl: string;
+  method: string;
+  path: string;
+  headers?: Record<string, string>;
+  body?: unknown;
+  rawBody?: string;
+}): Promise<{ status: number; headers: IncomingHttpHeaders; text: string; json: any }> {
+  const url = new URL(params.path, params.baseUrl);
+  const payload =
+    params.rawBody !== undefined
+      ? params.rawBody
+      : params.body !== undefined
+        ? JSON.stringify(params.body)
+        : undefined;
+  const reqHeaders: Record<string, string | number> = {
+    ...(params.headers ?? {}),
+  };
+  if (payload !== undefined) {
+    if (!Object.keys(reqHeaders).some((k) => k.toLowerCase() === 'content-type')) {
+      reqHeaders['content-type'] = 'application/json';
+    }
+    reqHeaders['content-length'] = Buffer.byteLength(payload, 'utf8');
+  }
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        hostname: url.hostname,
+        port: Number(url.port),
+        path: `${url.pathname}${url.search}`,
+        method: params.method,
+        headers: reqHeaders,
+      },
+      (res: IncomingMessage) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          let json: any = undefined;
+          if (text.length > 0) {
+            try {
+              json = JSON.parse(text);
+            } catch {
+              json = undefined;
+            }
+          }
+          resolve({
+            status: res.statusCode ?? 0,
+            headers: res.headers,
+            text,
+            json,
+          });
+        });
+      }
+    );
+    req.on('error', reject);
+    if (payload !== undefined) req.write(payload, 'utf8');
+    req.end();
+  });
+}
 
 async function httpJsonRequest(params: {
   baseUrl: string;
@@ -1024,5 +1097,563 @@ describe('Empirical 8-Scenario Red-vs-Blue Benchmark Assertions', () => {
     } finally {
       vault.close();
     }
+  });
+});
+
+describe('Bearer Authentication, Fail-Closed Binding & Streamable HTTP /mcp', () => {
+  test('23. Non-loopback host fails closed when authToken is missing/short or masterKey is missing/default', async () => {
+    assert.equal(isLoopbackHost('127.0.0.1'), true);
+    assert.equal(isLoopbackHost('::1'), true);
+    assert.equal(isLoopbackHost('localhost'), true);
+    assert.equal(isLoopbackHost('LOCALHOST'), true);
+    assert.equal(isLoopbackHost('100.108.223.41'), false);
+    assert.equal(isLoopbackHost('0.0.0.0'), false);
+    assert.equal(isLoopbackHost('::'), false);
+    assert.equal(isLoopbackHost('127.0.0.2'), false);
+
+    const prevToken = process.env.PW1_AUTH_TOKEN;
+    const prevMaster = process.env.PW1_MASTER_KEY;
+    try {
+      delete process.env.PW1_AUTH_TOKEN;
+      delete process.env.PW1_MASTER_KEY;
+
+      // 1. Non-loopback host without authToken
+      await assert.rejects(
+        startPasswordOneServer({
+          port: 0,
+          host: '100.108.223.41',
+          dataPath: ':memory:',
+          masterKey: 'strong-explicit-prod-master-key-2026',
+          scryptN: 1024,
+        }),
+        PasswordOneError
+      );
+
+      // 2. Non-loopback host with authToken shorter than 16 chars
+      await assert.rejects(
+        startPasswordOneServer({
+          port: 0,
+          host: '100.108.223.41',
+          dataPath: ':memory:',
+          masterKey: 'strong-explicit-prod-master-key-2026',
+          authToken: 'short-15-chars!',
+          scryptN: 1024,
+        }),
+        PasswordOneError
+      );
+
+      // 3. Wildcard bind 0.0.0.0 without authToken
+      await assert.rejects(
+        startPasswordOneServer({
+          port: 0,
+          host: '0.0.0.0',
+          dataPath: ':memory:',
+          masterKey: 'strong-explicit-prod-master-key-2026',
+          scryptN: 1024,
+        }),
+        PasswordOneError
+      );
+
+      // 4. Non-loopback host with valid authToken but missing masterKey (env unset)
+      await assert.rejects(
+        startPasswordOneServer({
+          port: 0,
+          host: '100.108.223.41',
+          dataPath: ':memory:',
+          authToken: 'valid-bearer-token-at-least-16-chars',
+          scryptN: 1024,
+        }),
+        PasswordOneError
+      );
+
+      // 5. Non-loopback host with empty PW1_MASTER_KEY env var
+      process.env.PW1_MASTER_KEY = '   ';
+      await assert.rejects(
+        startPasswordOneServer({
+          port: 0,
+          host: '100.108.223.41',
+          dataPath: ':memory:',
+          authToken: 'valid-bearer-token-at-least-16-chars',
+          scryptN: 1024,
+        }),
+        PasswordOneError
+      );
+
+      // 6. Non-loopback host with PW1_MASTER_KEY equal to hardcoded dev default
+      process.env.PW1_MASTER_KEY = DEFAULT_DEV_MASTER_KEY;
+      await assert.rejects(
+        startPasswordOneServer({
+          port: 0,
+          host: '100.108.223.41',
+          dataPath: ':memory:',
+          authToken: 'valid-bearer-token-at-least-16-chars',
+          scryptN: 1024,
+        }),
+        PasswordOneError
+      );
+
+      // 7. Non-loopback host with options.masterKey equal to hardcoded dev default
+      delete process.env.PW1_MASTER_KEY;
+      await assert.rejects(
+        startPasswordOneServer({
+          port: 0,
+          host: '100.108.223.41',
+          dataPath: ':memory:',
+          masterKey: DEFAULT_DEV_MASTER_KEY,
+          authToken: 'valid-bearer-token-at-least-16-chars',
+          scryptN: 1024,
+        }),
+        PasswordOneError
+      );
+    } finally {
+      if (prevToken === undefined) delete process.env.PW1_AUTH_TOKEN;
+      else process.env.PW1_AUTH_TOKEN = prevToken;
+      if (prevMaster === undefined) delete process.env.PW1_MASTER_KEY;
+      else process.env.PW1_MASTER_KEY = prevMaster;
+    }
+  });
+
+  test('24. Bearer auth minimizes unauthenticated /health and guards /v1/* and /mcp with 401', async () => {
+    const token = 'pw1-bearer-auth-token-test-2026-secure';
+    const prevToken = process.env.PW1_AUTH_TOKEN;
+    process.env.PW1_AUTH_TOKEN = `  ${token}  `;
+
+    const srv = await startPasswordOneServer({
+      port: 0,
+      host: '127.0.0.1',
+      dataPath: ':memory:',
+      masterKey: 'auth-test-master-key-2026',
+      scryptN: 1024,
+    });
+
+    try {
+      assert.equal(srv.authEnabled, true);
+
+      // Unauthenticated GET /health returns minimal payload only
+      const healthAnon = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'GET',
+        path: '/health',
+      });
+      assert.equal(healthAnon.status, 200);
+      assert.deepEqual(healthAnon.json, {
+        ok: true,
+        service: 'password-one',
+        version: SERVICE_VERSION,
+      });
+      assert.equal('secretsCount' in healthAnon.json, false);
+      assert.equal('auditHeadHash' in healthAnon.json, false);
+      assert.equal('activeGrantsCount' in healthAnon.json, false);
+
+      // Wrong token on GET /health also returns minimal payload only
+      const healthWrong = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'GET',
+        path: '/health',
+        headers: { Authorization: 'Bearer wrong-token-value' },
+      });
+      assert.equal(healthWrong.status, 200);
+      assert.deepEqual(healthWrong.json, {
+        ok: true,
+        service: 'password-one',
+        version: SERVICE_VERSION,
+      });
+
+      // Valid Bearer token on GET /health returns full runtime status
+      const healthAuthed = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'GET',
+        path: '/health',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      assert.equal(healthAuthed.status, 200);
+      assert.equal(healthAuthed.json.ok, true);
+      assert.equal(healthAuthed.json.service, 'password-one');
+      assert.equal(healthAuthed.json.version, SERVICE_VERSION);
+      assert.equal(healthAuthed.json.secretsCount, 0);
+      assert.equal(healthAuthed.json.activeGrantsCount, 0);
+      assert.equal(healthAuthed.json.auditChainValid, true);
+      assert.equal(typeof healthAuthed.json.auditHeadHash, 'string');
+      assert.equal(typeof healthAuthed.json.uptimeMs, 'number');
+
+      const expectedUnauthorized = {
+        ok: false,
+        error: {
+          code: 'UNAUTHORIZED',
+          message: 'Valid Bearer token required',
+        },
+      };
+
+      // Missing / wrong / non-Bearer tokens rejected with 401 on /v1/secrets and /mcp
+      const sameLengthWrong = 'x'.repeat(token.length);
+      for (const reqSpec of [
+        { method: 'GET', path: '/v1/secrets', headers: undefined },
+        { method: 'GET', path: '/v1/secrets', headers: { Authorization: 'Bearer short-wrong' } },
+        { method: 'GET', path: '/v1/secrets', headers: { Authorization: `Bearer ${sameLengthWrong}` } },
+        { method: 'GET', path: '/v1/secrets', headers: { Authorization: `Basic ${token}` } },
+        {
+          method: 'POST',
+          path: '/mcp',
+          headers: undefined,
+          body: { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+        },
+        {
+          method: 'POST',
+          path: '/mcp',
+          headers: { Authorization: `Bearer ${sameLengthWrong}` },
+          body: { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+        },
+        { method: 'GET', path: '/mcp', headers: undefined },
+        { method: 'DELETE', path: '/mcp', headers: undefined },
+      ]) {
+        const res = await httpRawRequest({
+          baseUrl: srv.baseUrl,
+          method: reqSpec.method,
+          path: reqSpec.path,
+          headers: reqSpec.headers,
+          body: reqSpec.body,
+        });
+        assert.equal(res.status, 401, `Expected 401 for ${reqSpec.method} ${reqSpec.path}`);
+        assert.deepEqual(res.json, expectedUnauthorized);
+      }
+
+      // Valid Bearer token accesses /v1/secrets normally
+      const secretsOk = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'GET',
+        path: '/v1/secrets',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      assert.equal(secretsOk.status, 200);
+      assert.equal(secretsOk.json.ok, true);
+      assert.deepEqual(secretsOk.json.secrets, []);
+    } finally {
+      await srv.close();
+      if (prevToken === undefined) delete process.env.PW1_AUTH_TOKEN;
+      else process.env.PW1_AUTH_TOKEN = prevToken;
+    }
+  });
+
+  test('25. Streamable HTTP /mcp supports initialize, notifications/initialized (202), tools/list, tools/call, batches, GET 405, DELETE 200', async () => {
+    const token = 'pw1-streamable-mcp-auth-token-2026-xyz';
+    const fakeSecret = 'sk_' + 'live_StreamableMcpSecret889900';
+
+    const srv = await startPasswordOneServer({
+      port: 0,
+      host: '127.0.0.1',
+      dataPath: ':memory:',
+      masterKey: 'streamable-mcp-master-key-2026',
+      authToken: token,
+      scryptN: 1024,
+    });
+
+    try {
+      srv.vault.upsertSecret({
+        alias: 'stripe/mcp_http_key',
+        value: fakeSecret,
+        description: 'Streamable MCP test secret',
+        policy: { allowedHosts: ['api.stripe.com'], allowedTools: ['http'] },
+      });
+
+      const authHeaders = {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/json, text/event-stream',
+      };
+
+      // 1. initialize -> 200 OK + Mcp-Session-Id header
+      const initRes = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/mcp',
+        headers: authHeaders,
+        body: {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2025-03-26',
+            capabilities: {},
+            clientInfo: { name: 'test-streamable-client', version: '1.0.0' },
+          },
+        },
+      });
+      assert.equal(initRes.status, 200);
+      assert.equal(initRes.headers['content-type'], 'application/json; charset=utf-8');
+      const sessionId = initRes.headers['mcp-session-id'];
+      assert.equal(typeof sessionId, 'string');
+      assert.equal((sessionId as string).length >= 16, true);
+      assert.equal(initRes.json.jsonrpc, '2.0');
+      assert.equal(initRes.json.id, 1);
+      assert.equal(initRes.json.result.protocolVersion, '2025-03-26');
+      assert.equal(initRes.json.result.serverInfo.name, '@opc/password-one');
+      assert.equal(initRes.json.result.serverInfo.version, SERVICE_VERSION);
+
+      const sessionHeaders = {
+        ...authHeaders,
+        'Mcp-Session-Id': sessionId as string,
+      };
+
+      // 2. notifications/initialized (no id) -> 202 Accepted
+      const notifyRes = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/mcp',
+        headers: sessionHeaders,
+        body: {
+          jsonrpc: '2.0',
+          method: 'notifications/initialized',
+        },
+      });
+      assert.equal(notifyRes.status, 202);
+      assert.equal(notifyRes.text, '');
+
+      // 3. tools/list -> exact 5 safe tools, zero plaintext-read tools
+      const listRes = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/mcp',
+        headers: sessionHeaders,
+        body: {
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'tools/list',
+        },
+      });
+      assert.equal(listRes.status, 200);
+      assert.equal(listRes.headers['content-type'], 'application/json; charset=utf-8');
+      const toolNames = (listRes.json.result.tools as { name: string }[]).map((t) => t.name);
+      assert.deepEqual(toolNames, [
+        'pw1_list_handles',
+        'pw1_http_request',
+        'pw1_exec_command',
+        'pw1_scrub_output',
+        'pw1_audit_verify',
+      ]);
+      for (const name of toolNames) {
+        assert.doesNotMatch(name, /get_secret|read_secret|plaintext|decrypt|reveal/i);
+      }
+
+      // 4. tools/call pw1_list_handles -> lists opaque handle, never plaintext
+      const handlesRes = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/mcp',
+        headers: sessionHeaders,
+        body: {
+          jsonrpc: '2.0',
+          id: 3,
+          method: 'tools/call',
+          params: { name: 'pw1_list_handles', arguments: {} },
+        },
+      });
+      assert.equal(handlesRes.status, 200);
+      const handlesText = String(handlesRes.json.result.content[0].text);
+      assert.equal(handlesText.includes('pw1://stripe/mcp_http_key'), true);
+      assert.equal(handlesText.includes(fakeSecret), false);
+
+      // 5. tools/call pw1_scrub_output -> scrubs raw and Base64 secret encodings
+      const b64Secret = Buffer.from(fakeSecret, 'utf8').toString('base64');
+      const scrubRes = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/mcp',
+        headers: sessionHeaders,
+        body: {
+          jsonrpc: '2.0',
+          id: 4,
+          method: 'tools/call',
+          params: {
+            name: 'pw1_scrub_output',
+            arguments: { text: `Leaked raw=${fakeSecret} b64=${b64Secret}` },
+          },
+        },
+      });
+      assert.equal(scrubRes.status, 200);
+      const scrubPayload = JSON.parse(String(scrubRes.json.result.content[0].text));
+      assert.equal(scrubPayload.redactionsCount >= 2, true);
+      assert.deepEqual(scrubPayload.redactedAliases, ['stripe/mcp_http_key']);
+      assert.equal(scrubPayload.scrubbedText.includes(fakeSecret), false);
+      assert.equal(scrubPayload.scrubbedText.includes(b64Secret), false);
+      assert.equal(
+        scrubPayload.scrubbedText,
+        'Leaked raw=[REDACTED:pw1://stripe/mcp_http_key] b64=[REDACTED:pw1://stripe/mcp_http_key]'
+      );
+
+      // 6. JSON-RPC batch (mixed notification + request -> 200 array; notifications-only -> 202; empty -> 400; malformed -> 400)
+      const batchMixed = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/mcp',
+        headers: sessionHeaders,
+        body: [
+          { jsonrpc: '2.0', method: 'notifications/initialized' },
+          { jsonrpc: '2.0', id: 5, method: 'ping' },
+        ],
+      });
+      assert.equal(batchMixed.status, 200);
+      assert.equal(Array.isArray(batchMixed.json), true);
+      assert.equal(batchMixed.json.length, 1);
+      assert.equal(batchMixed.json[0].id, 5);
+      assert.deepEqual(batchMixed.json[0].result, {});
+
+      const batchNotifyOnly = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/mcp',
+        headers: sessionHeaders,
+        body: [{ jsonrpc: '2.0', method: 'notifications/initialized' }],
+      });
+      assert.equal(batchNotifyOnly.status, 202);
+      assert.equal(batchNotifyOnly.text, '');
+
+      const batchEmpty = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/mcp',
+        headers: sessionHeaders,
+        body: [],
+      });
+      assert.equal(batchEmpty.status, 400);
+      assert.equal(batchEmpty.json.error.code, -32600);
+
+      const badJson = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/mcp',
+        headers: sessionHeaders,
+        rawBody: '{not valid json',
+      });
+      assert.equal(badJson.status, 400);
+      assert.equal(badJson.json.error.code, -32700);
+
+      // 7. GET /mcp -> 405 Method Not Allowed with Allow: POST, DELETE
+      const getMcp = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'GET',
+        path: '/mcp',
+        headers: sessionHeaders,
+      });
+      assert.equal(getMcp.status, 405);
+      assert.equal(getMcp.headers['allow'], 'POST, DELETE');
+
+      // 8. DELETE /mcp -> 200 OK { ok: true }
+      const delMcp = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'DELETE',
+        path: '/mcp',
+        headers: sessionHeaders,
+      });
+      assert.equal(delMcp.status, 200);
+      assert.deepEqual(delMcp.json, { ok: true });
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test('26. CLI serve supports env configuration and never logs PW1_MASTER_KEY or PW1_AUTH_TOKEN', async () => {
+    const cliMasterKey = 'cli-sentinel-master-key-do-not-log-9988';
+    const cliAuthToken = 'cli-sentinel-bearer-token-do-not-log-7766';
+
+    const child = spawn(process.execPath, ['src/cli.ts', 'serve'], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        HOST: '127.0.0.1',
+        PORT: '0',
+        DATA_PATH: ':memory:',
+        PW1_MASTER_KEY: cliMasterKey,
+        PW1_AUTH_TOKEN: cliAuthToken,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdoutBuf = '';
+    let stderrBuf = '';
+    let childExited = false;
+    const childExitPromise = new Promise<number | null>((resolve) => {
+      child.once('exit', (code: number | null) => {
+        childExited = true;
+        resolve(code);
+      });
+    });
+
+    try {
+      const listeningUrl = await new Promise<string>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error(`CLI serve timed out. stdout=${stdoutBuf} stderr=${stderrBuf}`));
+        }, 5000);
+
+        child.stdout?.on('data', (chunk: Buffer) => {
+          stdoutBuf += chunk.toString('utf8');
+          const match = /Listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(stdoutBuf);
+          if (match) {
+            clearTimeout(timeout);
+            resolve(match[1]);
+          }
+        });
+        child.stderr?.on('data', (chunk: Buffer) => {
+          stderrBuf += chunk.toString('utf8');
+        });
+        void childExitPromise.then((code) => {
+          clearTimeout(timeout);
+          reject(new Error(`CLI exited early with code ${String(code)}: ${stderrBuf}`));
+        });
+      });
+
+      assert.equal(stdoutBuf.includes(cliMasterKey), false);
+      assert.equal(stdoutBuf.includes(cliAuthToken), false);
+      assert.equal(stderrBuf.includes(cliMasterKey), false);
+      assert.equal(stderrBuf.includes(cliAuthToken), false);
+
+      const unauthSecrets = await httpRawRequest({
+        baseUrl: listeningUrl,
+        method: 'GET',
+        path: '/v1/secrets',
+      });
+      assert.equal(unauthSecrets.status, 401);
+
+      const authedSecrets = await httpRawRequest({
+        baseUrl: listeningUrl,
+        method: 'GET',
+        path: '/v1/secrets',
+        headers: { Authorization: `Bearer ${cliAuthToken}` },
+      });
+      assert.equal(authedSecrets.status, 200);
+      assert.equal(authedSecrets.json.ok, true);
+    } finally {
+      if (!childExited) {
+        child.kill('SIGTERM');
+      }
+      await childExitPromise;
+    }
+
+    // Fail-closed CLI check on non-loopback without PW1_AUTH_TOKEN
+    const failChild = spawn(process.execPath, ['src/cli.ts', 'serve'], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        HOST: '100.108.223.41',
+        PORT: '0',
+        DATA_PATH: ':memory:',
+        PW1_MASTER_KEY: cliMasterKey,
+        PW1_AUTH_TOKEN: '',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let failOut = '';
+    let failErr = '';
+    failChild.stdout?.on('data', (c: Buffer) => {
+      failOut += c.toString('utf8');
+    });
+    failChild.stderr?.on('data', (c: Buffer) => {
+      failErr += c.toString('utf8');
+    });
+    const failCode = await new Promise<number | null>((resolve) => {
+      failChild.once('exit', (code: number | null) => resolve(code));
+    });
+    assert.notEqual(failCode, 0);
+    assert.match(failErr, /Refusing to bind non-loopback host/);
+    assert.equal(failOut.includes(cliMasterKey), false);
+    assert.equal(failErr.includes(cliMasterKey), false);
   });
 });

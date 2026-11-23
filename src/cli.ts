@@ -147,7 +147,7 @@ async function main(): Promise<void> {
   if (subcommand === 'serve' || subcommand === 'start') {
     const running = await startPasswordOneServer();
     console.log(
-      `[password-one] Listening on ${running.baseUrl} (default=${DEFAULT_HOST}:${DEFAULT_PORT}, db=${running.vault.dbPath})`
+      `[password-one] Listening on ${running.baseUrl} (auth=${running.authEnabled ? 'bearer' : 'disabled-loopback'}, mcp=${running.baseUrl}/mcp, default=${DEFAULT_HOST}:${DEFAULT_PORT}, db=${running.vault.dbPath})`
     );
     const shutdown = (): void => {
       void running.close().then(() => process.exit(0));
@@ -181,4 +181,8 @@ async function main(): Promise<void> {
   process.exit(1);
 }
 
-void main();
+main().catch((err: unknown) => {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error(`[password-one] Startup error: ${msg}`);
+  process.exit(1);
+});
