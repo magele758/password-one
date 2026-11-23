@@ -27,6 +27,7 @@ export interface PasswordOneServerOptions {
   dataPath?: string;
   masterKey?: string;
   authToken?: string;
+  brokerToken?: string;
   scryptN?: number;
   brokerOptions?: BrokerOptions;
 }
@@ -39,6 +40,7 @@ export interface RunningPasswordOneServer {
   port: number;
   baseUrl: string;
   authEnabled: boolean;
+  brokerAuthEnabled: boolean;
   close: () => Promise<void>;
 }
 
@@ -67,13 +69,31 @@ function extractBearerToken(req: IncomingMessage): string | null {
   return match ? match[1] : null;
 }
 
-function isAuthorizedRequest(req: IncomingMessage, expectedTokenDigest: Buffer): boolean {
+type AuthRole = 'admin' | 'broker' | 'none';
+
+function resolveAuthRole(
+  req: IncomingMessage,
+  expectedAdminDigest: Buffer | null,
+  expectedBrokerDigest: Buffer | null
+): AuthRole {
   const presented = extractBearerToken(req);
   if (!presented) {
-    return false;
+    return 'none';
   }
   const presentedDigest = sha256Digest(presented);
-  return timingSafeEqual(presentedDigest, expectedTokenDigest);
+  const isAdmin = expectedAdminDigest !== null && timingSafeEqual(presentedDigest, expectedAdminDigest);
+  const isBroker = expectedBrokerDigest !== null && timingSafeEqual(presentedDigest, expectedBrokerDigest);
+  if (isAdmin) return 'admin';
+  if (isBroker) return 'broker';
+  return 'none';
+}
+
+function isAdminOnlyRoute(method: string, pathname: string): boolean {
+  if (method === 'POST' && pathname === '/v1/secrets') return true;
+  if (method === 'DELETE' && pathname.startsWith('/v1/secrets/')) return true;
+  if (method === 'POST' && pathname === '/v1/grants') return true;
+  if (method === 'POST' && pathname === '/v1/benchmark') return true;
+  return false;
 }
 
 function sendJson(
@@ -157,14 +177,43 @@ export async function startPasswordOneServer(
     options?.authToken !== undefined
       ? options.authToken.trim() || undefined
       : process.env.PW1_AUTH_TOKEN?.trim() || undefined;
+  const brokerToken =
+    options?.brokerToken !== undefined
+      ? options.brokerToken.trim() || undefined
+      : process.env.PW1_BROKER_TOKEN?.trim() || undefined;
   const rawMasterKey = options?.masterKey !== undefined ? options.masterKey : process.env.PW1_MASTER_KEY;
   const trimmedMasterKey = rawMasterKey?.trim() ?? '';
+
+  if (authToken && /[\r\n]/.test(authToken)) {
+    throw new PasswordOneError('INVALID_INPUT', 'PW1_AUTH_TOKEN must not contain CR/LF characters', 400);
+  }
+  if (brokerToken && /[\r\n]/.test(brokerToken)) {
+    throw new PasswordOneError('INVALID_INPUT', 'PW1_BROKER_TOKEN must not contain CR/LF characters', 400);
+  }
+
+  const expectedAdminDigest = authToken ? sha256Digest(authToken) : null;
+  const expectedBrokerDigest = brokerToken ? sha256Digest(brokerToken) : null;
+
+  if (expectedAdminDigest && expectedBrokerDigest && timingSafeEqual(expectedAdminDigest, expectedBrokerDigest)) {
+    throw new PasswordOneError(
+      'INVALID_INPUT',
+      'PW1_AUTH_TOKEN and PW1_BROKER_TOKEN must be distinct tokens',
+      400
+    );
+  }
 
   if (!isLoopbackHost(host)) {
     if (!authToken || authToken.length < MIN_AUTH_TOKEN_LENGTH) {
       throw new PasswordOneError(
         'INVALID_INPUT',
         `Refusing to bind non-loopback host "${host}" without PW1_AUTH_TOKEN (minimum ${MIN_AUTH_TOKEN_LENGTH} characters)`,
+        400
+      );
+    }
+    if (brokerToken !== undefined && brokerToken.length < MIN_AUTH_TOKEN_LENGTH) {
+      throw new PasswordOneError(
+        'INVALID_INPUT',
+        `Refusing to bind non-loopback host "${host}" with weak PW1_BROKER_TOKEN (minimum ${MIN_AUTH_TOKEN_LENGTH} characters)`,
         400
       );
     }
@@ -179,7 +228,7 @@ export async function startPasswordOneServer(
 
   const masterKey =
     rawMasterKey !== undefined && trimmedMasterKey.length > 0 ? rawMasterKey : DEFAULT_DEV_MASTER_KEY;
-  const expectedTokenDigest = authToken ? sha256Digest(authToken) : null;
+  const authRequired = expectedAdminDigest !== null || expectedBrokerDigest !== null;
 
   const vault = new PasswordOneVault({
     dbPath: dataPath,
@@ -209,8 +258,10 @@ export async function startPasswordOneServer(
       const parsedUrl = new URL(req.url ?? '/', `http://${urlHost}:${port}`);
       const pathname = parsedUrl.pathname;
 
+      const authRole = authRequired ? resolveAuthRole(req, expectedAdminDigest, expectedBrokerDigest) : 'admin';
+
       if (method === 'GET' && pathname === '/health') {
-        if (expectedTokenDigest && !isAuthorizedRequest(req, expectedTokenDigest)) {
+        if (authRequired && authRole === 'none') {
           sendJson(res, 200, {
             ok: true,
             service: 'password-one',
@@ -233,7 +284,7 @@ export async function startPasswordOneServer(
         return;
       }
 
-      if (expectedTokenDigest && !isAuthorizedRequest(req, expectedTokenDigest)) {
+      if (authRequired && authRole === 'none') {
         sendJson(
           res,
           401,
@@ -246,6 +297,17 @@ export async function startPasswordOneServer(
           },
           { 'www-authenticate': 'Bearer realm="password-one"' }
         );
+        return;
+      }
+
+      if (authRequired && isAdminOnlyRoute(method, pathname) && authRole !== 'admin') {
+        sendJson(res, 403, {
+          ok: false,
+          error: {
+            code: 'FORBIDDEN',
+            message: 'Admin token required for this endpoint',
+          },
+        });
         return;
       }
 
@@ -365,6 +427,12 @@ export async function startPasswordOneServer(
         }
 
         sendJson(res, 200, response, extraHeaders);
+        return;
+      }
+
+      if (method === 'GET' && pathname === '/v1/handles') {
+        const handles = vault.listSecrets();
+        sendJson(res, 200, { ok: true, handles });
         return;
       }
 
@@ -511,7 +579,8 @@ export async function startPasswordOneServer(
     host,
     port: boundPort,
     baseUrl,
-    authEnabled: expectedTokenDigest !== null,
+    authEnabled: authRequired,
+    brokerAuthEnabled: expectedBrokerDigest !== null,
     close,
   };
 }

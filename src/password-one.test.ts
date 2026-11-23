@@ -16,6 +16,7 @@ import { PassThrough } from 'node:stream';
 import { describe, test } from 'node:test';
 import { runRedBlueBenchmark } from './benchmark.ts';
 import { PasswordOneBroker } from './broker.ts';
+import { runRemoteCli } from './cli.ts';
 import {
   computePolicyHash,
   decryptSecretEnvelope,
@@ -1655,5 +1656,821 @@ describe('Bearer Authentication, Fail-Closed Binding & Streamable HTTP /mcp', ()
     assert.match(failErr, /Refusing to bind non-loopback host/);
     assert.equal(failOut.includes(cliMasterKey), false);
     assert.equal(failErr.includes(cliMasterKey), false);
+  });
+});
+
+describe('Scrubber Pass B Compact JSON Integrity, Dual-Token Isolation, MCP Annotations & Remote CLI', () => {
+  test('27. Scrubber Pass B redacts upper/lower %xx secrets in compact JSON, URLs & headers without corrupting unrelated %22/%5C', () => {
+    const scrubber = new OutputScrubber();
+    const secret = 'sk_' + 'live_CompactJson/Alpha+99=';
+    const delimSecret = 'pw1_delim_"quote"\\slash_77';
+    const active = [
+      { alias: 'stripe/compact', value: secret },
+      { alias: 'misc/delim', value: delimSecret },
+    ];
+
+    const upperFull = secret
+      .replace(/_/g, '%5F')
+      .replace(/\//g, '%2F')
+      .replace(/\+/g, '%2B')
+      .replace(/=/g, '%3D');
+    const lowerFull = upperFull.toLowerCase().replace('compactjson', 'CompactJson').replace('alpha', 'Alpha');
+    const upperUnderscoreOnly = secret.replace(/_/g, '%5F');
+    const lowerUnderscoreOnly = secret.replace(/_/g, '%5f');
+
+    // Compact JSON (zero spaces) combining upper/lower %xx secrets with unrelated %22 and %5C in OTHER fields and SAME field
+    const compactPayload = JSON.stringify({
+      leakedUpper: upperFull,
+      leakedLower: lowerFull,
+      leakedPartialUpper: upperUnderscoreOnly,
+      leakedPartialLower: lowerUnderscoreOnly,
+      unrelatedQuotes: 'keep%22quoted%5Cpath%5cintact',
+      unrelatedJsonChars: '%7B%22k%22%3A%22v%22%7D',
+      sameFieldMixed: `https://api.example.com/cb?token=${lowerFull}&note=hello%22world%5Cend`,
+    });
+    assert.equal(compactPayload.includes(' '), false);
+
+    const res = scrubber.scrub(compactPayload, active);
+    assert.equal(res.redactionsCount >= 5, true);
+    assert.deepEqual(res.redactedAliases, ['stripe/compact']);
+    for (const leaked of [secret, upperFull, lowerFull, upperUnderscoreOnly, lowerUnderscoreOnly]) {
+      assert.equal(res.scrubbedText.includes(leaked), false, `Secret variant leaked: ${leaked}`);
+    }
+
+    // Compact JSON MUST still parse cleanly and keep unrelated %22/%5C fields intact
+    const parsed = JSON.parse(res.scrubbedText) as Record<string, string>;
+    assert.equal(parsed.leakedUpper, '[REDACTED:pw1://stripe/compact]');
+    assert.equal(parsed.leakedLower, '[REDACTED:pw1://stripe/compact]');
+    assert.equal(parsed.leakedPartialUpper, '[REDACTED:pw1://stripe/compact]');
+    assert.equal(parsed.leakedPartialLower, '[REDACTED:pw1://stripe/compact]');
+    assert.equal(parsed.unrelatedQuotes, 'keep%22quoted%5Cpath%5cintact');
+    assert.equal(parsed.unrelatedJsonChars, '%7B%22k%22%3A%22v%22%7D');
+    assert.equal(
+      parsed.sameFieldMixed,
+      'https://api.example.com/cb?token=[REDACTED:pw1://stripe/compact]&note=hello%22world%5Cend'
+    );
+
+    // URL query strings & HTTP headers with upper/lower %xx are still caught cleanly
+    const headerRes = scrubber.scrubHeaders(
+      {
+        'X-Debug-Url': `https://api.example.com/v1?a=1%222&k=${upperFull}&b=3%5C4`,
+        'X-Debug-Header': `Bearer ${lowerUnderscoreOnly}; extra=foo%22bar`,
+      },
+      active
+    );
+    assert.equal(headerRes.redactionsCount, 2);
+    assert.equal(
+      headerRes.headers['X-Debug-Url'],
+      'https://api.example.com/v1?a=1%222&k=[REDACTED:pw1://stripe/compact]&b=3%5C4'
+    );
+    assert.equal(
+      headerRes.headers['X-Debug-Header'],
+      'Bearer [REDACTED:pw1://stripe/compact]; extra=foo%22bar'
+    );
+
+    // Idempotence check
+    const second = scrubber.scrub(res.scrubbedText, active);
+    assert.equal(second.redactionsCount, 0);
+    assert.equal(second.scrubbedText, res.scrubbedText);
+  });
+
+  test('28. Dual-token startup fails closed on identical tokens and weak non-loopback brokerToken', async () => {
+    const prevAuth = process.env.PW1_AUTH_TOKEN;
+    const prevBroker = process.env.PW1_BROKER_TOKEN;
+    const prevMaster = process.env.PW1_MASTER_KEY;
+    try {
+      delete process.env.PW1_AUTH_TOKEN;
+      delete process.env.PW1_BROKER_TOKEN;
+      delete process.env.PW1_MASTER_KEY;
+
+      // 1. Identical authToken and brokerToken rejected
+      await assert.rejects(
+        startPasswordOneServer({
+          port: 0,
+          host: '127.0.0.1',
+          dataPath: ':memory:',
+          masterKey: 'dual-fail-closed-master-key-2026',
+          authToken: 'same-token-value-123456',
+          brokerToken: 'same-token-value-123456',
+          scryptN: 1024,
+        }),
+        (err: unknown) => err instanceof PasswordOneError && err.code === 'INVALID_INPUT' && err.statusCode === 400
+      );
+
+      // 2. Tokens differing only by leading/trailing whitespace rejected
+      await assert.rejects(
+        startPasswordOneServer({
+          port: 0,
+          host: '127.0.0.1',
+          dataPath: ':memory:',
+          masterKey: 'dual-fail-closed-master-key-2026',
+          authToken: '  whitespace-only-diff-token-99  ',
+          brokerToken: 'whitespace-only-diff-token-99',
+          scryptN: 1024,
+        }),
+        (err: unknown) => err instanceof PasswordOneError && err.code === 'INVALID_INPUT' && err.statusCode === 400
+      );
+
+      // 3. Non-loopback host with weak brokerToken (< 16 chars) rejected even with strong authToken & masterKey
+      await assert.rejects(
+        startPasswordOneServer({
+          port: 0,
+          host: '100.108.223.41',
+          dataPath: ':memory:',
+          masterKey: 'strong-explicit-prod-master-key-2026',
+          authToken: 'strong-admin-token-at-least-16-chars',
+          brokerToken: 'weak-15-chars!!',
+          scryptN: 1024,
+        }),
+        (err: unknown) => err instanceof PasswordOneError && err.code === 'INVALID_INPUT' && err.statusCode === 400
+      );
+
+      // 4. Non-loopback host with only brokerToken (no authToken) rejected
+      await assert.rejects(
+        startPasswordOneServer({
+          port: 0,
+          host: '100.108.223.41',
+          dataPath: ':memory:',
+          masterKey: 'strong-explicit-prod-master-key-2026',
+          brokerToken: 'strong-broker-token-at-least-16-chars',
+          scryptN: 1024,
+        }),
+        (err: unknown) => err instanceof PasswordOneError && err.code === 'INVALID_INPUT' && err.statusCode === 400
+      );
+    } finally {
+      if (prevAuth === undefined) delete process.env.PW1_AUTH_TOKEN;
+      else process.env.PW1_AUTH_TOKEN = prevAuth;
+      if (prevBroker === undefined) delete process.env.PW1_BROKER_TOKEN;
+      else process.env.PW1_BROKER_TOKEN = prevBroker;
+      if (prevMaster === undefined) delete process.env.PW1_MASTER_KEY;
+      else process.env.PW1_MASTER_KEY = prevMaster;
+    }
+  });
+
+  test('29. Dual-token Admin vs Broker isolation enforces 403 FORBIDDEN on admin routes, allows broker routes & handles broker-only loopback', async () => {
+    const adminToken = 'pw1-admin-token-super-secret-2026-aaa';
+    const brokerToken = 'pw1-broker-token-agent-scoped-2026-bbb';
+    const secretVal = 'sk_' + 'live_DualTokenRoleSecret9988';
+
+    const upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
+      const auth = String(req.headers['authorization'] ?? '');
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ authorized: auth === `Bearer ${secretVal}`, echo: auth }));
+    });
+    await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', r));
+    const upPort = (upstream.address() as AddressInfo).port;
+
+    const srv = await startPasswordOneServer({
+      port: 0,
+      host: '127.0.0.1',
+      dataPath: ':memory:',
+      masterKey: 'dual-token-test-master-key-2026',
+      authToken: adminToken,
+      brokerToken,
+      scryptN: 1024,
+      brokerOptions: {
+        resolveOverrides: {
+          'api.dual.internal': { address: '127.0.0.1', port: upPort },
+        },
+      },
+    });
+
+    try {
+      assert.equal(srv.authEnabled, true);
+      assert.equal(srv.brokerAuthEnabled, true);
+
+      const adminHeaders = { Authorization: `Bearer ${adminToken}` };
+      const brokerHeaders = { Authorization: `Bearer ${brokerToken}` };
+      const expectedForbidden = {
+        ok: false,
+        error: {
+          code: 'FORBIDDEN',
+          message: 'Admin token required for this endpoint',
+        },
+      };
+
+      // Unauthenticated GET /health -> minimal; GET /v1/handles -> 401
+      const healthAnon = await httpRawRequest({ baseUrl: srv.baseUrl, method: 'GET', path: '/health' });
+      assert.equal(healthAnon.status, 200);
+      assert.deepEqual(healthAnon.json, { ok: true, service: 'password-one', version: SERVICE_VERSION });
+
+      const handlesAnon = await httpRawRequest({ baseUrl: srv.baseUrl, method: 'GET', path: '/v1/handles' });
+      assert.equal(handlesAnon.status, 401);
+
+      // Admin sets up secret & grant
+      const createRes = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/v1/secrets',
+        headers: adminHeaders,
+        body: {
+          alias: 'stripe/dual_key',
+          value: secretVal,
+          description: 'Dual token E2E secret',
+          policy: {
+            allowedHosts: ['api.dual.internal'],
+            allowedTools: ['http', 'exec'],
+            allowedCommands: ['node'],
+            allowHttp: true,
+            allowEnvInjection: true,
+            requireGrant: true,
+          },
+        },
+      });
+      assert.equal(createRes.status, 201);
+
+      const grantRes = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/v1/grants',
+        headers: adminHeaders,
+        body: {
+          alias: 'stripe/dual_key',
+          agentId: 'broker-agent',
+          maxUses: 5,
+          ttlSeconds: 120,
+        },
+      });
+      assert.equal(grantRes.status, 201);
+      const grantId = String(grantRes.json.grant.grantId);
+
+      // Broker token gets 403 FORBIDDEN on all 4 Admin-only endpoints
+      const brokerCreate = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/v1/secrets',
+        headers: brokerHeaders,
+        body: { alias: 'evil/new', value: 'should_fail_123', policy: { allowedHosts: ['example.com'], allowedTools: ['http'] } },
+      });
+      assert.equal(brokerCreate.status, 403);
+      assert.deepEqual(brokerCreate.json, expectedForbidden);
+
+      const brokerDelete = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'DELETE',
+        path: '/v1/secrets/stripe/dual_key',
+        headers: brokerHeaders,
+      });
+      assert.equal(brokerDelete.status, 403);
+      assert.deepEqual(brokerDelete.json, expectedForbidden);
+
+      const brokerGrant = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/v1/grants',
+        headers: brokerHeaders,
+        body: { alias: 'stripe/dual_key', agentId: 'rogue' },
+      });
+      assert.equal(brokerGrant.status, 403);
+      assert.deepEqual(brokerGrant.json, expectedForbidden);
+
+      const brokerBench = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/v1/benchmark',
+        headers: brokerHeaders,
+        body: { microIterations: 5 },
+      });
+      assert.equal(brokerBench.status, 403);
+      assert.deepEqual(brokerBench.json, expectedForbidden);
+
+      // Broker token gets 200 on all Broker-allowed endpoints + authenticated /health stats
+      const brokerHealth = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'GET',
+        path: '/health',
+        headers: brokerHeaders,
+      });
+      assert.equal(brokerHealth.status, 200);
+      assert.equal(brokerHealth.json.secretsCount, 1);
+      assert.equal(brokerHealth.text.includes(secretVal), false);
+
+      const brokerHandles = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'GET',
+        path: '/v1/handles',
+        headers: brokerHeaders,
+      });
+      assert.equal(brokerHandles.status, 200);
+      assert.equal(brokerHandles.json.ok, true);
+      assert.equal(brokerHandles.json.handles.length, 1);
+      assert.equal(brokerHandles.json.handles[0].handle, 'pw1://stripe/dual_key');
+      assert.equal(brokerHandles.text.includes(secretVal), false);
+
+      const brokerSecretsMeta = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'GET',
+        path: '/v1/secrets',
+        headers: brokerHeaders,
+      });
+      assert.equal(brokerSecretsMeta.status, 200);
+      assert.equal(brokerSecretsMeta.text.includes(secretVal), false);
+
+      const brokerHttp = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/v1/proxy/http',
+        headers: brokerHeaders,
+        body: {
+          url: 'http://api.dual.internal/check',
+          auth: { type: 'bearer', secret: 'pw1://stripe/dual_key' },
+          agentId: 'broker-agent',
+          grantId,
+        },
+      });
+      assert.equal(brokerHttp.status, 200);
+      assert.equal(JSON.parse(String(brokerHttp.json.result.body)).authorized, true);
+      assert.equal(brokerHttp.text.includes(secretVal), false);
+
+      const brokerExec = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/v1/proxy/exec',
+        headers: brokerHeaders,
+        body: {
+          command: process.execPath,
+          args: ['-e', 'process.stdout.write("len=" + process.env.DUAL_K.length + " leak=" + process.env.DUAL_K)'],
+          secretEnv: { DUAL_K: 'pw1://stripe/dual_key' },
+          agentId: 'broker-agent',
+          grantId,
+        },
+      });
+      assert.equal(brokerExec.status, 200);
+      assert.equal(brokerExec.json.result.stdout, `len=${secretVal.length} leak=[REDACTED:pw1://stripe/dual_key]`);
+
+      const brokerScrub = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/v1/scrub',
+        headers: brokerHeaders,
+        body: { text: `raw=${secretVal}` },
+      });
+      assert.equal(brokerScrub.status, 200);
+      assert.equal(brokerScrub.json.result.scrubbedText, 'raw=[REDACTED:pw1://stripe/dual_key]');
+
+      const brokerAudit = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'GET',
+        path: '/v1/audit?limit=10',
+        headers: brokerHeaders,
+      });
+      assert.equal(brokerAudit.status, 200);
+      assert.equal(brokerAudit.json.verification.valid, true);
+
+      // Broker token succeeds on /mcp and verifies exact MCP tool annotations.readOnlyHint
+      const mcpList = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'POST',
+        path: '/mcp',
+        headers: brokerHeaders,
+        body: { jsonrpc: '2.0', id: 42, method: 'tools/list' },
+      });
+      assert.equal(mcpList.status, 200);
+      const annotationsByName = Object.fromEntries(
+        (mcpList.json.result.tools as { name: string; annotations?: { readOnlyHint?: boolean } }[]).map((t) => [
+          t.name,
+          t.annotations?.readOnlyHint,
+        ])
+      );
+      assert.deepEqual(annotationsByName, {
+        pw1_list_handles: true,
+        pw1_http_request: false,
+        pw1_exec_command: false,
+        pw1_scrub_output: true,
+        pw1_audit_verify: true,
+      });
+
+      // Admin token can still delete secret
+      const adminDelete = await httpRawRequest({
+        baseUrl: srv.baseUrl,
+        method: 'DELETE',
+        path: '/v1/secrets/stripe/dual_key',
+        headers: adminHeaders,
+      });
+      assert.equal(adminDelete.status, 200);
+      assert.equal(adminDelete.json.deleted, true);
+    } finally {
+      await srv.close();
+      await new Promise<void>((r) => upstream.close(() => r()));
+    }
+
+    // Broker-only loopback mode (brokerToken set without authToken): broker endpoints 200, admin endpoints 403, anon 401
+    const brokerOnlySrv = await startPasswordOneServer({
+      port: 0,
+      host: '127.0.0.1',
+      dataPath: ':memory:',
+      masterKey: 'broker-only-loopback-key-2026',
+      authToken: '',
+      brokerToken,
+      scryptN: 1024,
+    });
+    try {
+      assert.equal(brokerOnlySrv.authEnabled, true);
+      assert.equal(brokerOnlySrv.brokerAuthEnabled, true);
+
+      const anonRes = await httpRawRequest({ baseUrl: brokerOnlySrv.baseUrl, method: 'GET', path: '/v1/handles' });
+      assert.equal(anonRes.status, 401);
+
+      const okHandles = await httpRawRequest({
+        baseUrl: brokerOnlySrv.baseUrl,
+        method: 'GET',
+        path: '/v1/handles',
+        headers: { Authorization: `Bearer ${brokerToken}` },
+      });
+      assert.equal(okHandles.status, 200);
+      assert.deepEqual(okHandles.json, { ok: true, handles: [] });
+
+      const forbiddenCreate = await httpRawRequest({
+        baseUrl: brokerOnlySrv.baseUrl,
+        method: 'POST',
+        path: '/v1/secrets',
+        headers: { Authorization: `Bearer ${brokerToken}` },
+        body: { alias: 'a/b', value: '12345678', policy: { allowedHosts: ['example.com'], allowedTools: ['http'] } },
+      });
+      assert.equal(forbiddenCreate.status, 403);
+      assert.equal(forbiddenCreate.json.error.code, 'FORBIDDEN');
+    } finally {
+      await brokerOnlySrv.close();
+    }
+  });
+
+  test('30. Remote CLI subcommands (handles, http, exec, scrub, audit-verify) work E2E with Broker token and never leak tokens', async () => {
+    const adminToken = 'pw1-cli-admin-token-secret-2026-1111';
+    const brokerToken = 'pw1-cli-broker-token-secret-2026-2222';
+    const secretVal = 'sk_' + 'live_RemoteCliSecret776655';
+
+    const upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        const reqUrl = new URL(req.url ?? '/', 'http://api.cli.internal');
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            method: req.method,
+            path: reqUrl.pathname,
+            query: Object.fromEntries(reqUrl.searchParams.entries()),
+            authHeader: req.headers['authorization'] ?? null,
+            customAuthHeader: req.headers['x-api-token'] ?? null,
+            xTrace: req.headers['x-trace'] ?? null,
+            xExtra: req.headers['x-extra'] ?? null,
+            body: Buffer.concat(chunks).toString('utf8'),
+          })
+        );
+      });
+    });
+    await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', r));
+    const upPort = (upstream.address() as AddressInfo).port;
+
+    const srv = await startPasswordOneServer({
+      port: 0,
+      host: '127.0.0.1',
+      dataPath: ':memory:',
+      masterKey: 'remote-cli-e2e-master-key-2026',
+      authToken: adminToken,
+      brokerToken,
+      scryptN: 1024,
+      brokerOptions: {
+        resolveOverrides: {
+          'api.cli.internal': { address: '127.0.0.1', port: upPort },
+        },
+      },
+    });
+
+    try {
+      srv.vault.upsertSecret({
+        alias: 'stripe/cli_key',
+        value: secretVal,
+        description: 'Remote CLI E2E key',
+        policy: {
+          allowedHosts: ['api.cli.internal'],
+          allowedTools: ['http', 'exec'],
+          allowedCommands: ['node'],
+          allowHttp: true,
+          allowEnvInjection: true,
+          requireGrant: true,
+        },
+      });
+      const grant = srv.vault.createGrant({
+        alias: 'stripe/cli_key',
+        agentId: 'cli-agent',
+        maxUses: 10,
+        ttlSeconds: 120,
+      });
+
+      const baseEnv: Record<string, string | undefined> = {
+        PW1_URL: srv.baseUrl,
+        PW1_BROKER_TOKEN: brokerToken,
+      };
+
+      const runCaptured = async (
+        argv: string[],
+        envOverride?: Record<string, string | undefined>,
+        stdinText?: string
+      ) => {
+        const outStream = new PassThrough();
+        const errStream = new PassThrough();
+        const inStream = new PassThrough();
+        let outText = '';
+        let errText = '';
+        outStream.on('data', (c: Buffer) => {
+          outText += c.toString('utf8');
+        });
+        errStream.on('data', (c: Buffer) => {
+          errText += c.toString('utf8');
+        });
+        if (stdinText !== undefined) {
+          inStream.end(stdinText, 'utf8');
+        } else {
+          inStream.end();
+        }
+        const res = await runRemoteCli(argv, envOverride ?? baseEnv, {
+          stdin: inStream,
+          stdout: outStream,
+          stderr: errStream,
+        });
+        assert.equal(outText, res.stdout);
+        assert.equal(errText, res.stderr);
+        assert.equal(outText.includes(brokerToken), false);
+        assert.equal(errText.includes(brokerToken), false);
+        assert.equal(outText.includes(adminToken), false);
+        assert.equal(errText.includes(adminToken), false);
+        assert.equal(outText.includes(secretVal), false);
+        assert.equal(errText.includes(secretVal), false);
+        return res;
+      };
+
+      // 1. handles
+      const handlesRes = await runCaptured(['handles']);
+      assert.equal(handlesRes.exitCode, 0);
+      assert.equal(handlesRes.stderr, '');
+      const handlesJson = JSON.parse(handlesRes.stdout);
+      assert.equal(handlesJson.ok, true);
+      assert.equal(handlesJson.handles[0].handle, 'pw1://stripe/cli_key');
+
+      // 2. http with --auth-bearer, repeatable --header, repeatable --query, --body, --method, --agent-id, --grant-id, --timeout-ms
+      const httpBearerRes = await runCaptured([
+        'http',
+        '--url',
+        'http://api.cli.internal/v1/charge',
+        '--method',
+        'POST',
+        '--header',
+        'X-Trace: trace-1:ok',
+        '--header',
+        'X-Extra: two',
+        '--query',
+        'mode=live',
+        '--query',
+        'tag=a=b',
+        '--body',
+        '{"amount":100}',
+        '--auth-bearer',
+        'pw1://stripe/cli_key',
+        '--agent-id',
+        'cli-agent',
+        '--grant-id',
+        grant.grantId,
+        '--timeout-ms',
+        '5000',
+      ]);
+      assert.equal(httpBearerRes.exitCode, 0);
+      const httpBearerBody = JSON.parse(JSON.parse(httpBearerRes.stdout).result.body);
+      assert.equal(httpBearerBody.method, 'POST');
+      assert.equal(httpBearerBody.query.mode, 'live');
+      assert.equal(httpBearerBody.query.tag, 'a=b');
+      assert.equal(httpBearerBody.xTrace, 'trace-1:ok');
+      assert.equal(httpBearerBody.xExtra, 'two');
+      assert.equal(httpBearerBody.body, '{"amount":100}');
+      assert.equal(httpBearerBody.authHeader, 'Bearer [REDACTED:pw1://stripe/cli_key]');
+
+      // 3. http with --auth-header, --auth-basic, --auth-query
+      const httpHeaderRes = await runCaptured([
+        'http',
+        '--url',
+        'http://api.cli.internal/v1/hdr',
+        '--auth-header',
+        'X-Api-Token=pw1://stripe/cli_key',
+        '--agent-id',
+        'cli-agent',
+        '--grant-id',
+        grant.grantId,
+      ]);
+      assert.equal(httpHeaderRes.exitCode, 0);
+      assert.equal(
+        JSON.parse(JSON.parse(httpHeaderRes.stdout).result.body).customAuthHeader,
+        '[REDACTED:pw1://stripe/cli_key]'
+      );
+
+      const httpBasicRes = await runCaptured([
+        'http',
+        '--url',
+        'http://api.cli.internal/v1/basic',
+        '--auth-basic',
+        'merchant:pw1://stripe/cli_key',
+        '--agent-id',
+        'cli-agent',
+        '--grant-id',
+        grant.grantId,
+      ]);
+      assert.equal(httpBasicRes.exitCode, 0);
+      assert.equal(
+        JSON.parse(JSON.parse(httpBasicRes.stdout).result.body).authHeader,
+        'Basic [REDACTED:pw1://stripe/cli_key]'
+      );
+
+      const httpQueryRes = await runCaptured([
+        'http',
+        '--url',
+        'http://api.cli.internal/v1/qry',
+        '--auth-query',
+        'api_key=pw1://stripe/cli_key',
+        '--agent-id',
+        'cli-agent',
+        '--grant-id',
+        grant.grantId,
+      ]);
+      assert.equal(httpQueryRes.exitCode, 0);
+      assert.equal(
+        JSON.parse(JSON.parse(httpQueryRes.stdout).result.body).query.api_key,
+        '[REDACTED:pw1://stripe/cli_key]'
+      );
+
+      // 4. exec with repeatable --arg, --secret-env, --env, --cwd, --timeout-ms, --agent-id, --grant-id
+      const execRes = await runCaptured([
+        'exec',
+        '--command',
+        process.execPath,
+        '--arg',
+        '-e',
+        '--arg',
+        'process.stdout.write(JSON.stringify({ label: process.env.CLI_LABEL, len: process.env.CLI_SEC.length, echoed: process.env.CLI_SEC }))',
+        '--secret-env',
+        'CLI_SEC=pw1://stripe/cli_key',
+        '--env',
+        'CLI_LABEL=ok',
+        '--cwd',
+        process.cwd(),
+        '--timeout-ms',
+        '5000',
+        '--agent-id',
+        'cli-agent',
+        '--grant-id',
+        grant.grantId,
+      ]);
+      assert.equal(execRes.exitCode, 0);
+      const execPayload = JSON.parse(execRes.stdout);
+      assert.equal(execPayload.ok, true);
+      assert.equal(execPayload.result.exitCode, 0);
+      const execOutObj = JSON.parse(String(execPayload.result.stdout));
+      assert.equal(execOutObj.label, 'ok');
+      assert.equal(execOutObj.len, secretVal.length);
+      assert.equal(execOutObj.echoed, '[REDACTED:pw1://stripe/cli_key]');
+
+      // 5. scrub via --text and via stdin
+      const scrubFlagRes = await runCaptured(['scrub', '--text', `leaked=${secretVal}`]);
+      assert.equal(scrubFlagRes.exitCode, 0);
+      assert.equal(JSON.parse(scrubFlagRes.stdout).result.scrubbedText, 'leaked=[REDACTED:pw1://stripe/cli_key]');
+
+      const scrubStdinRes = await runCaptured(['scrub'], baseEnv, `stdin_b64=${Buffer.from(secretVal).toString('base64')}`);
+      assert.equal(scrubStdinRes.exitCode, 0);
+      assert.equal(JSON.parse(scrubStdinRes.stdout).result.scrubbedText, 'stdin_b64=[REDACTED:pw1://stripe/cli_key]');
+
+      // 6. audit-verify with --limit
+      const auditRes = await runCaptured(['audit-verify', '--limit', '3']);
+      assert.equal(auditRes.exitCode, 0);
+      const auditPayload = JSON.parse(auditRes.stdout);
+      assert.equal(auditPayload.ok, true);
+      assert.equal(auditPayload.verification.valid, true);
+      assert.equal(auditPayload.entries.length <= 3, true);
+
+      // 7. Security: reject CR/LF in tokens without leaking token
+      const badToken = 'injected-broker-token\r\nX-Evil: 1';
+      const crlfRes = await runCaptured(['handles'], {
+        PW1_URL: srv.baseUrl,
+        PW1_BROKER_TOKEN: badToken,
+      });
+      assert.notEqual(crlfRes.exitCode, 0);
+      assert.equal(crlfRes.stdout, '');
+      assert.equal(crlfRes.stderr.includes('injected-broker-token'), false);
+      assert.equal(crlfRes.stderr.includes('X-Evil'), false);
+      const crlfErr = JSON.parse(crlfRes.stderr);
+      assert.equal(crlfErr.ok, false);
+      assert.match(crlfErr.error.message, /CR\/LF/);
+
+      // 8. Security: non-2xx (401) prints sanitized JSON error to stderr and never leaks wrong token
+      const wrongToken = 'wrong-sentinel-token-never-print-8899';
+      const unauthRes = await runCaptured(['handles'], {
+        PW1_URL: srv.baseUrl,
+        PW1_BROKER_TOKEN: wrongToken,
+      });
+      assert.notEqual(unauthRes.exitCode, 0);
+      assert.equal(unauthRes.stdout, '');
+      assert.equal(unauthRes.stderr.includes(wrongToken), false);
+      assert.equal(unauthRes.stderr.toLowerCase().includes('authorization'), false);
+      const unauthErr = JSON.parse(unauthRes.stderr);
+      assert.equal(unauthErr.ok, false);
+      assert.equal(unauthErr.status, 401);
+      assert.equal(unauthErr.error.code, 'UNAUTHORIZED');
+
+      // 9. Security: network error & timeout sanitize token and exit non-zero
+      const connRefusedRes = await runCaptured(['handles'], {
+        PW1_URL: 'http://127.0.0.1:1',
+        PW1_BROKER_TOKEN: brokerToken,
+      });
+      assert.notEqual(connRefusedRes.exitCode, 0);
+      assert.equal(connRefusedRes.stdout, '');
+      assert.equal(connRefusedRes.stderr.includes(brokerToken), false);
+      const netErr = JSON.parse(connRefusedRes.stderr);
+      assert.equal(netErr.ok, false);
+      assert.equal(netErr.error.code, 'NETWORK_ERROR');
+      assert.equal(netErr.error.message.length > 0, true);
+
+      // Timeout + hostile server echoing Authorization header back in 500 response
+      const slowOrHostile = createServer((req: IncomingMessage, res: ServerResponse) => {
+        if (req.url === '/slow/v1/handles') {
+          // Intentionally stall beyond client timeout
+          return;
+        }
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error: {
+              code: 'LEAKY_UPSTREAM',
+              message: `Echoed Authorization: ${String(req.headers['authorization'] ?? '')}`,
+            },
+          })
+        );
+      });
+      await new Promise<void>((r) => slowOrHostile.listen(0, '127.0.0.1', r));
+      const hostilePort = (slowOrHostile.address() as AddressInfo).port;
+      try {
+        const timeoutRes = await runCaptured(['handles'], {
+          PW1_URL: `http://127.0.0.1:${hostilePort}/slow`,
+          PW1_BROKER_TOKEN: brokerToken,
+          PW1_TIMEOUT_MS: '120',
+        });
+        assert.notEqual(timeoutRes.exitCode, 0);
+        assert.equal(timeoutRes.stderr.includes(brokerToken), false);
+        assert.equal(JSON.parse(timeoutRes.stderr).error.code, 'TIMEOUT');
+
+        const hostileRes = await runCaptured(['handles'], {
+          PW1_URL: `http://127.0.0.1:${hostilePort}`,
+          PW1_BROKER_TOKEN: brokerToken,
+        });
+        assert.notEqual(hostileRes.exitCode, 0);
+        assert.equal(hostileRes.stderr.includes(brokerToken), false);
+        assert.equal(hostileRes.stderr.includes(`Bearer ${brokerToken}`), false);
+      } finally {
+        await new Promise<void>((r) => slowOrHostile.close(() => r()));
+      }
+
+      // 10. PW1_AUTH_TOKEN fallback when PW1_BROKER_TOKEN unset, and CR/LF rejection on PW1_AUTH_TOKEN
+      const fallbackRes = await runCaptured(['handles'], {
+        PW1_URL: srv.baseUrl,
+        PW1_AUTH_TOKEN: adminToken,
+      });
+      assert.equal(fallbackRes.exitCode, 0);
+      assert.equal(JSON.parse(fallbackRes.stdout).handles[0].handle, 'pw1://stripe/cli_key');
+
+      const crlfAuthRes = await runCaptured(['handles'], {
+        PW1_URL: srv.baseUrl,
+        PW1_AUTH_TOKEN: 'admin-token\nX-Injected: 1',
+      });
+      assert.notEqual(crlfAuthRes.exitCode, 0);
+      assert.equal(crlfAuthRes.stderr.includes('admin-token'), false);
+      assert.match(JSON.parse(crlfAuthRes.stderr).error.message, /CR\/LF/);
+
+      // 11. Direct spawned `node src/cli.ts handles` subprocess check
+      const cliChild = spawn(process.execPath, ['src/cli.ts', 'handles'], {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          PW1_URL: srv.baseUrl,
+          PW1_BROKER_TOKEN: brokerToken,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let cliOut = '';
+      let cliErr = '';
+      cliChild.stdout?.on('data', (c: Buffer) => {
+        cliOut += c.toString('utf8');
+      });
+      cliChild.stderr?.on('data', (c: Buffer) => {
+        cliErr += c.toString('utf8');
+      });
+      const cliExitCode = await new Promise<number | null>((resolve) => {
+        cliChild.once('exit', (code: number | null) => resolve(code));
+      });
+      assert.equal(cliExitCode, 0);
+      assert.equal(cliErr, '');
+      assert.equal(cliOut.includes(brokerToken), false);
+      assert.equal(cliOut.includes(secretVal), false);
+      assert.equal(JSON.parse(cliOut).handles[0].handle, 'pw1://stripe/cli_key');
+    } finally {
+      await srv.close();
+      await new Promise<void>((r) => upstream.close(() => r()));
+    }
   });
 });

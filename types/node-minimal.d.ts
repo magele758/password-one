@@ -84,6 +84,10 @@ interface TimerHandle {
 declare function setTimeout(callback: (...args: unknown[]) => void, ms?: number): TimerHandle;
 declare function clearTimeout(timeoutId: TimerHandle | undefined): void;
 
+interface ImportMeta {
+  url: string;
+}
+
 declare var process: {
   env: Record<string, string | undefined>;
   argv: string[];
@@ -315,6 +319,11 @@ declare module 'node:fs' {
   export function readFileSync(path: string, encoding: BufferEncoding): string;
   export function writeFileSync(path: string, data: string | Uint8Array, encoding?: BufferEncoding): void;
   export function mkdtempSync(prefix: string): string;
+  export function realpathSync(path: string): string;
+}
+
+declare module 'node:url' {
+  export function fileURLToPath(url: string | URL): string;
 }
 
 declare module 'node:os' {

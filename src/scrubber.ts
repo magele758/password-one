@@ -85,19 +85,185 @@ function computeThreePhaseBase64Slices(secret: string): { std: string[]; url: st
   return { std, url };
 }
 
-function safeUnescapePercent(span: string): string {
-  // Decode contiguous %XX hex byte runs as UTF-8 while tolerating surrounding raw punctuation
-  return span.replace(/(?:%[0-9A-Fa-f]{2})+/g, (pctRun) => {
-    try {
-      return decodeURIComponent(pctRun);
-    } catch {
-      const bytes: number[] = [];
-      for (let i = 0; i < pctRun.length; i += 3) {
-        bytes.push(parseInt(pctRun.slice(i + 1, i + 3), 16));
-      }
-      return Buffer.from(bytes).toString('utf8');
+function hexNibble(code: number): number {
+  if (code >= 0x30 && code <= 0x39) return code - 0x30;
+  if (code >= 0x41 && code <= 0x46) return code - 0x37;
+  if (code >= 0x61 && code <= 0x66) return code - 0x57;
+  return -1;
+}
+
+function parsePercentByteAt(span: string, pctIdx: number): number {
+  if (pctIdx + 2 >= span.length || span.charCodeAt(pctIdx) !== 0x25) return -1;
+  const hi = hexNibble(span.charCodeAt(pctIdx + 1));
+  const lo = hexNibble(span.charCodeAt(pctIdx + 2));
+  if (hi < 0 || lo < 0) return -1;
+  return (hi << 4) | lo;
+}
+
+function decodePercentSpanWithMap(span: string): {
+  decoded: string;
+  origStarts: number[];
+  origEnds: number[];
+} {
+  let decoded = '';
+  const origStarts: number[] = [];
+  const origEnds: number[] = [];
+  let i = 0;
+
+  while (i < span.length) {
+    const firstByte = parsePercentByteAt(span, i);
+    if (firstByte < 0) {
+      decoded += span[i]!;
+      origStarts.push(i);
+      origEnds.push(i + 1);
+      i += 1;
+      continue;
     }
-  });
+
+    const runStart = i;
+    const bytes: number[] = [];
+    while (i < span.length) {
+      const b = parsePercentByteAt(span, i);
+      if (b < 0) break;
+      bytes.push(b);
+      i += 3;
+    }
+
+    let bIdx = 0;
+    while (bIdx < bytes.length) {
+      const b0 = bytes[bIdx]!;
+      if (b0 < 0x80) {
+        decoded += String.fromCharCode(b0);
+        origStarts.push(runStart + bIdx * 3);
+        origEnds.push(runStart + (bIdx + 1) * 3);
+        bIdx += 1;
+      } else if ((b0 & 0xe0) === 0xc0 && b0 >= 0xc2 && bIdx + 1 < bytes.length) {
+        const b1 = bytes[bIdx + 1]!;
+        if ((b1 & 0xc0) === 0x80) {
+          const cp = ((b0 & 0x1f) << 6) | (b1 & 0x3f);
+          decoded += String.fromCharCode(cp);
+          origStarts.push(runStart + bIdx * 3);
+          origEnds.push(runStart + (bIdx + 2) * 3);
+          bIdx += 2;
+        } else {
+          decoded += '\uFFFD';
+          origStarts.push(runStart + bIdx * 3);
+          origEnds.push(runStart + (bIdx + 1) * 3);
+          bIdx += 1;
+        }
+      } else if ((b0 & 0xf0) === 0xe0 && bIdx + 2 < bytes.length) {
+        const b1 = bytes[bIdx + 1]!;
+        const b2 = bytes[bIdx + 2]!;
+        const cp = ((b0 & 0x0f) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f);
+        if ((b1 & 0xc0) === 0x80 && (b2 & 0xc0) === 0x80 && cp >= 0x800 && (cp < 0xd800 || cp > 0xdfff)) {
+          decoded += String.fromCharCode(cp);
+          origStarts.push(runStart + bIdx * 3);
+          origEnds.push(runStart + (bIdx + 3) * 3);
+          bIdx += 3;
+        } else {
+          decoded += '\uFFFD';
+          origStarts.push(runStart + bIdx * 3);
+          origEnds.push(runStart + (bIdx + 1) * 3);
+          bIdx += 1;
+        }
+      } else if ((b0 & 0xf8) === 0xf0 && bIdx + 3 < bytes.length) {
+        const b1 = bytes[bIdx + 1]!;
+        const b2 = bytes[bIdx + 2]!;
+        const b3 = bytes[bIdx + 3]!;
+        const cp = ((b0 & 0x07) << 18) | ((b1 & 0x3f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f);
+        if (
+          (b1 & 0xc0) === 0x80 &&
+          (b2 & 0xc0) === 0x80 &&
+          (b3 & 0xc0) === 0x80 &&
+          cp >= 0x10000 &&
+          cp <= 0x10ffff
+        ) {
+          const str = String.fromCodePoint(cp);
+          const sPos = runStart + bIdx * 3;
+          const ePos = runStart + (bIdx + 4) * 3;
+          decoded += str;
+          for (let k = 0; k < str.length; k++) {
+            origStarts.push(sPos);
+            origEnds.push(ePos);
+          }
+          bIdx += 4;
+        } else {
+          decoded += '\uFFFD';
+          origStarts.push(runStart + bIdx * 3);
+          origEnds.push(runStart + (bIdx + 1) * 3);
+          bIdx += 1;
+        }
+      } else {
+        decoded += '\uFFFD';
+        origStarts.push(runStart + bIdx * 3);
+        origEnds.push(runStart + (bIdx + 1) * 3);
+        bIdx += 1;
+      }
+    }
+  }
+
+  return { decoded, origStarts, origEnds };
+}
+
+const STRUCTURAL_DELIM_REGEX = /["',{}\[\]<>]/;
+const NARROW_PERCENT_SPAN_REGEX = /[^\s"',{}\[\]<>]*%[0-9A-Fa-f]{2}[^\s"',{}\[\]<>]*/g;
+const WIDE_PERCENT_SPAN_REGEX = /[^\s]*%[0-9A-Fa-f]{2}[^\s]*/g;
+const PERCENT_ESCAPE_REGEX = /%[0-9A-Fa-f]{2}/;
+
+function scrubPercentSpan(
+  span: string,
+  sortedSecrets: readonly ActiveSecretMaterial[],
+  recordHit: (label: string, encoding: EncodingKind, count: number, alias?: string) => void
+): string {
+  if (span.includes('[REDACTED:')) return span;
+  const { decoded, origStarts, origEnds } = decodePercentSpanWithMap(span);
+  const replacements: { start: number; end: number; alias: string; replacement: string }[] = [];
+
+  for (const s of sortedSecrets) {
+    let searchFrom = 0;
+    while (searchFrom <= decoded.length - s.value.length) {
+      const dStart = decoded.indexOf(s.value, searchFrom);
+      if (dStart === -1) break;
+      const dEnd = dStart + s.value.length;
+      const oStart = origStarts[dStart]!;
+      const oEnd = origEnds[dEnd - 1]!;
+      // Only claim spans that actually contain percent-encoding; leave raw secrets for Pass D
+      if (!PERCENT_ESCAPE_REGEX.test(span.slice(oStart, oEnd))) {
+        searchFrom = dStart + 1;
+        continue;
+      }
+
+      const overlaps = replacements.some((r) => oStart < r.end && oEnd > r.start);
+      if (overlaps) {
+        searchFrom = dStart + 1;
+        continue;
+      }
+
+      replacements.push({
+        start: oStart,
+        end: oEnd,
+        alias: s.alias,
+        replacement: `[REDACTED:pw1://${s.alias}]`,
+      });
+      searchFrom = dEnd;
+    }
+  }
+
+  if (replacements.length === 0) {
+    return span;
+  }
+
+  replacements.sort((a, b) => a.start - b.start);
+  let out = '';
+  let cursor = 0;
+  for (const rep of replacements) {
+    out += span.slice(cursor, rep.start);
+    out += rep.replacement;
+    cursor = rep.end;
+    recordHit(`pw1://${rep.alias}`, 'url_encoded', 1, rep.alias);
+  }
+  out += span.slice(cursor);
+  return out;
 }
 
 function tryDecodeBase64Utf8(token: string): string | null {
@@ -237,23 +403,26 @@ export class OutputScrubber {
       });
 
       // Pass B: Active percent-encoded span inspection (catches partial/mixed %XX encodings)
+      // Narrow spans stop at structural/JSON delimiters and splice only matched byte ranges so
+      // unrelated %22/%5C sequences in compact JSON or query strings are never decoded or corrupted.
       if (text.includes('%')) {
-        text = text.replace(/[^\s]*%[0-9A-Fa-f]{2}[^\s]*/g, (span) => {
-          if (span.includes('[REDACTED:')) return span;
-          const decoded = safeUnescapePercent(span);
-          let replaced = decoded;
-          let matchedAny = false;
-          for (const s of validSecrets) {
-            if (replaced.includes(s.value)) {
-              const parts = replaced.split(s.value);
-              const occurrences = parts.length - 1;
-              recordHit(`pw1://${s.alias}`, 'url_encoded', occurrences, s.alias);
-              replaced = parts.join(`[REDACTED:pw1://${s.alias}]`);
-              matchedAny = true;
-            }
+        const sortedByLength = [...validSecrets].sort((a, b) => b.value.length - a.value.length);
+        text = text.replace(NARROW_PERCENT_SPAN_REGEX, (span) =>
+          scrubPercentSpan(span, sortedByLength, recordHit)
+        );
+
+        const delimSecrets = sortedByLength.filter((s) => STRUCTURAL_DELIM_REGEX.test(s.value));
+        if (delimSecrets.length > 0 && text.includes('%')) {
+          const segments = text.split(/(\[REDACTED:[^\]]+\])/g);
+          for (let i = 0; i < segments.length; i++) {
+            const seg = segments[i]!;
+            if ((seg.startsWith('[REDACTED:') && seg.endsWith(']')) || !seg.includes('%')) continue;
+            segments[i] = seg.replace(WIDE_PERCENT_SPAN_REGEX, (span) =>
+              scrubPercentSpan(span, delimSecrets, recordHit)
+            );
           }
-          return matchedAny ? replaced : span;
-        });
+          text = segments.join('');
+        }
       }
 
       // Pass C: Active standalone Base64 / Base64URL token decode inspection (catches user:secret or JSON-wrapped b64)

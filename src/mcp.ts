@@ -42,6 +42,7 @@ export const MCP_TOOLS_DEFINITION = [
     name: 'pw1_list_handles',
     description:
       'List available opaque credential handles (pw1://<alias>) and their bound host/tool policies. Never exposes secret plaintext.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {},
@@ -52,6 +53,7 @@ export const MCP_TOOLS_DEFINITION = [
     name: 'pw1_http_request',
     description:
       'Execute an outbound HTTP request using blind credential handles ({{pw1://alias}}). Enforces host allowlists, blocks cross-origin 302 credential theft, and scrubs echoed secrets.',
+    annotations: { readOnlyHint: false },
     inputSchema: {
       type: 'object',
       properties: {
@@ -83,6 +85,7 @@ export const MCP_TOOLS_DEFINITION = [
     name: 'pw1_exec_command',
     description:
       'Execute an allowlisted CLI binary via shell-free execFile with clean-room environment secret injection and 6-encoding stdout/stderr scrubbing.',
+    annotations: { readOnlyHint: false },
     inputSchema: {
       type: 'object',
       properties: {
@@ -107,6 +110,7 @@ export const MCP_TOOLS_DEFINITION = [
     name: 'pw1_scrub_output',
     description:
       'Scrub arbitrary text or tool outputs against all active secrets across 6 encodings (raw, URL, Base64, Base64URL, JSON-escaped, Basic-Auth) plus high-risk credential patterns.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {
@@ -120,6 +124,7 @@ export const MCP_TOOLS_DEFINITION = [
     name: 'pw1_audit_verify',
     description:
       'Verify cryptographic integrity of the SHA-256 hash-chained audit ledger and return recent sanitized audit records.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
       properties: {

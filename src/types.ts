@@ -192,6 +192,7 @@ export interface AuditVerificationResult {
 export type ErrorCode =
   | 'INVALID_INPUT'
   | 'UNAUTHORIZED'
+  | 'FORBIDDEN'
   | 'SECRET_NOT_FOUND'
   | 'POLICY_VIOLATION'
   | 'POLICY_TAMPER_DETECTED'
