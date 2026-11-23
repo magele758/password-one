@@ -11,6 +11,7 @@ import {
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { PassThrough } from 'node:stream';
 import { describe, test } from 'node:test';
@@ -1797,6 +1798,32 @@ describe('Scrubber Pass B Compact JSON Integrity, Dual-Token Isolation, MCP Anno
         }),
         (err: unknown) => err instanceof PasswordOneError && err.code === 'INVALID_INPUT' && err.statusCode === 400
       );
+
+      // 5. Raw authToken / brokerToken with trailing CR/LF rejected BEFORE trimming
+      await assert.rejects(
+        startPasswordOneServer({
+          port: 0,
+          host: '127.0.0.1',
+          dataPath: ':memory:',
+          masterKey: 'dual-fail-closed-master-key-2026',
+          authToken: 'admin-token-with-trailing-lf\n',
+          scryptN: 1024,
+        }),
+        (err: unknown) => err instanceof PasswordOneError && err.code === 'INVALID_INPUT' && err.statusCode === 400
+      );
+
+      await assert.rejects(
+        startPasswordOneServer({
+          port: 0,
+          host: '127.0.0.1',
+          dataPath: ':memory:',
+          masterKey: 'dual-fail-closed-master-key-2026',
+          authToken: 'valid-admin-token-123456',
+          brokerToken: 'broker-token-with-trailing-crlf\r\n',
+          scryptN: 1024,
+        }),
+        (err: unknown) => err instanceof PasswordOneError && err.code === 'INVALID_INPUT' && err.statusCode === 400
+      );
     } finally {
       if (prevAuth === undefined) delete process.env.PW1_AUTH_TOKEN;
       else process.env.PW1_AUTH_TOKEN = prevAuth;
@@ -2422,6 +2449,7 @@ describe('Scrubber Pass B Compact JSON Integrity, Dual-Token Isolation, MCP Anno
         assert.notEqual(hostileRes.exitCode, 0);
         assert.equal(hostileRes.stderr.includes(brokerToken), false);
         assert.equal(hostileRes.stderr.includes(`Bearer ${brokerToken}`), false);
+        assert.equal(JSON.parse(hostileRes.stderr).error.message, 'Echoed Authorization: [REDACTED]');
       } finally {
         await new Promise<void>((r) => slowOrHostile.close(() => r()));
       }
@@ -2472,5 +2500,40 @@ describe('Scrubber Pass B Compact JSON Integrity, Dual-Token Isolation, MCP Anno
       await srv.close();
       await new Promise<void>((r) => upstream.close(() => r()));
     }
+  });
+
+  test('31. Scrubber Pass B is linear O(N) against 50KB ReDoS input and blocks unclosed [REDACTED: bypass', () => {
+    const scrubber = new OutputScrubber();
+    const normalSecret = 'sk_' + 'live_LinearScanSecret9988';
+    const delimSecret = 'pw1_delim_"quote"\\slash_9988';
+    const active = [
+      { alias: 'stripe/linear', value: normalSecret },
+      { alias: 'misc/delim', value: delimSecret },
+    ];
+
+    // (a) 50KB unbroken input ending in '%' must scrub in linear O(N) time (< 100ms), exercising both narrow and wide passes
+    const redosPayload = `${'x'.repeat(50_000)}%`;
+    const t0 = performance.now();
+    const redosRes = scrubber.scrub(redosPayload, active);
+    const elapsedMs = performance.now() - t0;
+    assert.equal(redosRes.redactionsCount, 0);
+    assert.equal(redosRes.scrubbedText, redosPayload);
+    assert.equal(elapsedMs < 100, true, `Expected linear O(N) Pass B scrub < 100ms, got ${elapsedMs.toFixed(2)}ms`);
+
+    // (b) Unclosed "[REDACTED:fake=" prefix adjacent to partially percent-encoded delimiter secret must NOT bypass scrubbing
+    const partialDelim = delimSecret.replace(/_/g, '%5F');
+    const bypassAttempt = `[REDACTED:fake=${partialDelim}`;
+    const bypassRes = scrubber.scrub(bypassAttempt, active);
+    assert.equal(bypassRes.redactionsCount, 1);
+    assert.deepEqual(bypassRes.redactedAliases, ['misc/delim']);
+    assert.equal(bypassRes.scrubbedText.includes(partialDelim), false);
+    assert.equal(bypassRes.scrubbedText.includes(delimSecret), false);
+    assert.equal(bypassRes.scrubbedText, '[REDACTED:fake=[REDACTED:pw1://misc/delim]');
+
+    // Also verify unclosed "[REDACTED:fake=" prefix adjacent to normal percent-encoded secret is redacted
+    const partialNormal = normalSecret.replace(/_/g, '%5f');
+    const narrowBypassRes = scrubber.scrub(`[REDACTED:fake=${partialNormal}`, active);
+    assert.equal(narrowBypassRes.redactionsCount, 1);
+    assert.equal(narrowBypassRes.scrubbedText, '[REDACTED:fake=[REDACTED:pw1://stripe/linear]');
   });
 });

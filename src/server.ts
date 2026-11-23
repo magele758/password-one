@@ -173,23 +173,20 @@ export async function startPasswordOneServer(
     options?.dataPath ??
     (process.env.DATA_PATH?.trim() || undefined) ??
     join(process.cwd(), 'data', 'password-one.sqlite');
-  const authToken =
-    options?.authToken !== undefined
-      ? options.authToken.trim() || undefined
-      : process.env.PW1_AUTH_TOKEN?.trim() || undefined;
-  const brokerToken =
-    options?.brokerToken !== undefined
-      ? options.brokerToken.trim() || undefined
-      : process.env.PW1_BROKER_TOKEN?.trim() || undefined;
+  const rawAuthToken = options?.authToken !== undefined ? options.authToken : process.env.PW1_AUTH_TOKEN;
+  const rawBrokerToken = options?.brokerToken !== undefined ? options.brokerToken : process.env.PW1_BROKER_TOKEN;
   const rawMasterKey = options?.masterKey !== undefined ? options.masterKey : process.env.PW1_MASTER_KEY;
   const trimmedMasterKey = rawMasterKey?.trim() ?? '';
 
-  if (authToken && /[\r\n]/.test(authToken)) {
+  if (rawAuthToken !== undefined && /[\r\n]/.test(rawAuthToken)) {
     throw new PasswordOneError('INVALID_INPUT', 'PW1_AUTH_TOKEN must not contain CR/LF characters', 400);
   }
-  if (brokerToken && /[\r\n]/.test(brokerToken)) {
+  if (rawBrokerToken !== undefined && /[\r\n]/.test(rawBrokerToken)) {
     throw new PasswordOneError('INVALID_INPUT', 'PW1_BROKER_TOKEN must not contain CR/LF characters', 400);
   }
+
+  const authToken = rawAuthToken?.trim() || undefined;
+  const brokerToken = rawBrokerToken?.trim() || undefined;
 
   const expectedAdminDigest = authToken ? sha256Digest(authToken) : null;
   const expectedBrokerDigest = brokerToken ? sha256Digest(brokerToken) : null;

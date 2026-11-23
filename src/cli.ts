@@ -198,8 +198,11 @@ function collectSensitiveEnvValues(env: Record<string, string | undefined>): str
 }
 
 function sanitizeCliText(text: string, sensitiveTokens: readonly string[]): string {
-  let out = text.replace(/\bauthorization\s*:\s*bearer\s+[^\s"',}\]]+/gi, 'Authorization: [REDACTED]');
-  out = out.replace(/\bauthorization\s*:\s*[^\r\n"',}\]]+/gi, 'Authorization: [REDACTED]');
+  let out = text.replace(/\bauthorization[ \t]*:[ \t]*bearer[ \t]+[^\s"',}\]]+/gi, 'Authorization: [REDACTED]');
+  out = out.replace(
+    /\bauthorization[ \t]*:[ \t]*(?!\[REDACTED\](?:$|[\s"',}\]]))[^\s\r\n"',}\]][^\r\n"',}\]]*/gi,
+    'Authorization: [REDACTED]'
+  );
   for (const tok of sensitiveTokens) {
     if (tok && out.includes(tok)) {
       out = out.split(tok).join('[REDACTED:pw1_token]');

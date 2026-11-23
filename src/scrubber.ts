@@ -206,8 +206,8 @@ function decodePercentSpanWithMap(span: string): {
 }
 
 const STRUCTURAL_DELIM_REGEX = /["',{}\[\]<>]/;
-const NARROW_PERCENT_SPAN_REGEX = /[^\s"',{}\[\]<>]*%[0-9A-Fa-f]{2}[^\s"',{}\[\]<>]*/g;
-const WIDE_PERCENT_SPAN_REGEX = /[^\s]*%[0-9A-Fa-f]{2}[^\s]*/g;
+const NARROW_SPAN_REGEX = /[^\s"',{}\[\]<>]+/g;
+const WIDE_SPAN_REGEX = /\S+/g;
 const PERCENT_ESCAPE_REGEX = /%[0-9A-Fa-f]{2}/;
 
 function scrubPercentSpan(
@@ -215,7 +215,7 @@ function scrubPercentSpan(
   sortedSecrets: readonly ActiveSecretMaterial[],
   recordHit: (label: string, encoding: EncodingKind, count: number, alias?: string) => void
 ): string {
-  if (span.includes('[REDACTED:')) return span;
+  if (!span.includes('%') || !PERCENT_ESCAPE_REGEX.test(span)) return span;
   const { decoded, origStarts, origEnds } = decodePercentSpanWithMap(span);
   const replacements: { start: number; end: number; alias: string; replacement: string }[] = [];
 
@@ -403,25 +403,31 @@ export class OutputScrubber {
       });
 
       // Pass B: Active percent-encoded span inspection (catches partial/mixed %XX encodings)
-      // Narrow spans stop at structural/JSON delimiters and splice only matched byte ranges so
-      // unrelated %22/%5C sequences in compact JSON or query strings are never decoded or corrupted.
+      // Uses linear O(N) maximal span matching (no regex backtracking) and splices only matched
+      // byte ranges so unrelated %22/%5C sequences in compact JSON or query strings are preserved.
       if (text.includes('%')) {
         const sortedByLength = [...validSecrets].sort((a, b) => b.value.length - a.value.length);
-        text = text.replace(NARROW_PERCENT_SPAN_REGEX, (span) =>
-          scrubPercentSpan(span, sortedByLength, recordHit)
-        );
+        const narrowSegments = text.split(/(\[REDACTED:[^\]]+\])/g);
+        for (let i = 0; i < narrowSegments.length; i++) {
+          const seg = narrowSegments[i]!;
+          if ((seg.startsWith('[REDACTED:') && seg.endsWith(']')) || !seg.includes('%')) continue;
+          narrowSegments[i] = seg.replace(NARROW_SPAN_REGEX, (span) =>
+            scrubPercentSpan(span, sortedByLength, recordHit)
+          );
+        }
+        text = narrowSegments.join('');
 
         const delimSecrets = sortedByLength.filter((s) => STRUCTURAL_DELIM_REGEX.test(s.value));
         if (delimSecrets.length > 0 && text.includes('%')) {
-          const segments = text.split(/(\[REDACTED:[^\]]+\])/g);
-          for (let i = 0; i < segments.length; i++) {
-            const seg = segments[i]!;
+          const wideSegments = text.split(/(\[REDACTED:[^\]]+\])/g);
+          for (let i = 0; i < wideSegments.length; i++) {
+            const seg = wideSegments[i]!;
             if ((seg.startsWith('[REDACTED:') && seg.endsWith(']')) || !seg.includes('%')) continue;
-            segments[i] = seg.replace(WIDE_PERCENT_SPAN_REGEX, (span) =>
+            wideSegments[i] = seg.replace(WIDE_SPAN_REGEX, (span) =>
               scrubPercentSpan(span, delimSecrets, recordHit)
             );
           }
-          text = segments.join('');
+          text = wideSegments.join('');
         }
       }
 
